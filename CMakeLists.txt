@@ -1,7 +1,25 @@
 cmake_minimum_required(VERSION 3.13)
 project(upmem_sdk_light LANGUAGES CXX)
+
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_VERBOSE_MAKEFILE TRUE)
 # set(CMAKE_CXX_COMPILER "g++")
+
+# Default to Release mode
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+
+# Common compile options
+set(COMMON_COMPILE_OPTIONS -Wall -Wextra -std=c++17 -march=native)
+
+# Build type specific options
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(BUILD_TYPE_OPTIONS -O0 -g)
+else()
+    set(BUILD_TYPE_OPTIONS -O3 -DNDEBUG)
+endif()
 
 set(UPMEM_SDK_DIR "$ENV{UPMEM_HOME}")
 set(UPMEM_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/upmem-sdk/src)
@@ -46,7 +64,7 @@ target_include_directories(example PUBLIC ${INCLUDE_DIR})
 target_link_directories(example PUBLIC ${UPMEM_SDK_DIR}/lib)
 target_link_libraries(example PUBLIC -ldpu)
 target_link_libraries(example PUBLIC Threads::Threads)
-target_compile_options(example PUBLIC -Wall -Wextra -O3 -g -std=c++17 -march=native)
+target_compile_options(example PUBLIC ${COMMON_COMPILE_OPTIONS} ${BUILD_TYPE_OPTIONS})
 set_target_properties(example PROPERTIES PUBLIC_HEADER ${CMAKE_CURRENT_SOURCE_DIR}/upmem_direct_c.h)
 
 # dpu part for example
@@ -75,7 +93,7 @@ target_link_directories(benchmark PUBLIC ${UPMEM_SDK_DIR}/lib)
 target_link_libraries(benchmark PUBLIC -ldpu)
 target_link_libraries(benchmark PUBLIC -lnuma)
 target_link_libraries(benchmark PUBLIC Threads::Threads)
-target_compile_options(benchmark PUBLIC -Wall -Wextra -O3 -g -std=c++17 -march=native)
+target_compile_options(benchmark PUBLIC ${COMMON_COMPILE_OPTIONS} ${BUILD_TYPE_OPTIONS})
 set_target_properties(benchmark PROPERTIES PUBLIC_HEADER ${CMAKE_CURRENT_SOURCE_DIR}/upmem_direct_c.h)
 
 # dpu part for benchmark

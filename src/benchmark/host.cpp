@@ -2,7 +2,8 @@
 
 #include <cassert>
 #include <cstdio>
-#include <iomanip>  // Add this line at the top of your file if it's not already there
+#include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <string>
 #include <sys/mman.h>
@@ -11,6 +12,9 @@
 #include "pim_interface_header.hpp"
 #include "timer.hpp"
 using namespace std;
+
+// Global CSV file stream
+ofstream csv_file;
 
 enum CommunicationDirection { Host2PIM = 0, PIM2Host = 1 };
 
@@ -35,8 +39,13 @@ void parse_arguments(int argc, char **argv, int &nr_ranks,
     }
 }
 
+void WriteCSVHeader() {
+    csv_file << "run,total_buffer_kb,test_buffer_kb,repeat,send_time_s,recv_time_s,"
+             << "total_time_s,send_bw_gbps,recv_bw_gbps,send_lat_s,recv_lat_s" << endl;
+}
+
 void TestMRAMThroughput(PIMInterface *interface,
-                        size_t MaxBufferSizePerDPU) {
+                        size_t MaxBufferSizePerDPU, int run_number) {
     const size_t MinTestSizePerDPU = 1 << 10;
     const size_t MaxTestSizePerDPU = std::min((size_t)1 << 20, MaxBufferSizePerDPU);
     const double timeLimitPerTest = 2.0;  // 2 seconds
@@ -138,6 +147,12 @@ void TestMRAMThroughput(PIMInterface *interface,
                 double receive_bandwidth = (double)bufferSizePerDPU * repeat *
                                            nrOfDPUs / recv_timer.total_time;
 
+                double send_bw_gbps = send_bandwidth / 1024.0 / 1024.0 / 1024.0;
+                double recv_bw_gbps = receive_bandwidth / 1024.0 / 1024.0 / 1024.0;
+                double send_lat = send_timer.total_time / repeat;
+                double recv_lat = recv_timer.total_time / repeat;
+
+                // Console output
                 printf(
                     "Total Buffer size: %5lu KB, Test Buffer "
                     "Size: %5lu KB, Repeat: %6lu, Send Time: %8.3lf s, Recv "
@@ -146,9 +161,21 @@ void TestMRAMThroughput(PIMInterface *interface,
                     MaxBufferSizePerDPU / 1024,
                     bufferSizePerDPU / 1024, repeat, send_timer.total_time,
                     recv_timer.total_time, total_timer.total_time,
-                    send_bandwidth / 1024.0 / 1024.0 / 1024.0,
-                    receive_bandwidth / 1024.0 / 1024.0 / 1024.0,
-                    send_timer.total_time / repeat, recv_timer.total_time / repeat);
+                    send_bw_gbps, recv_bw_gbps, send_lat, recv_lat);
+                fflush(stdout);
+
+                // CSV output
+                csv_file << run_number << ","
+                         << MaxBufferSizePerDPU / 1024 << ","
+                         << bufferSizePerDPU / 1024 << ","
+                         << repeat << ","
+                         << send_timer.total_time << ","
+                         << recv_timer.total_time << ","
+                         << total_timer.total_time << ","
+                         << send_bw_gbps << ","
+                         << recv_bw_gbps << ","
+                         << send_lat << ","
+                         << recv_lat << endl;
 
                 break;
             }
@@ -200,8 +227,15 @@ int main(int argc, char **argv) {
     pimInterface->Launch(false);
     pimInterface->PrintLog([](int i) { return (i % 100) == 0; });
 
-    TestMRAMThroughput(pimInterface, (6400 - 4) << 10);
-    TestMRAMThroughput(pimInterface, (6400 - 4) << 10);
+    // Open CSV file and write header
+    csv_file.open("benchmark_results.csv");
+    WriteCSVHeader();
+
+    TestMRAMThroughput(pimInterface, (6400 - 4) << 10, 1);
+    TestMRAMThroughput(pimInterface, (6400 - 4) << 10, 2);
+
+    csv_file.close();
+    cout << "Results saved to benchmark_results.csv" << endl;
 
     for (int i = 0; i < nrOfDPUs; i++) {
         delete[] dpuIDs[i];
