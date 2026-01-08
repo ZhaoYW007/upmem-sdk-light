@@ -1,5 +1,6 @@
 #include <parlay/parallel.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <fstream>
@@ -7,6 +8,7 @@
 #include <iostream>
 #include <string>
 #include <sys/mman.h>
+#include <vector>
 
 #include "common.h"
 #include "pim_interface_header.hpp"
@@ -40,33 +42,32 @@ void parse_arguments(int argc, char **argv, int &nr_ranks,
 }
 
 void WriteCSVHeader() {
-    csv_file << "run,total_buffer_kb,test_buffer_kb,repeat,send_time_s,recv_time_s,"
+    csv_file << "total_buffer_kb,test_buffer_kb,repeat,send_time_s,recv_time_s,"
              << "total_time_s,send_bw_gbps,recv_bw_gbps,send_lat_s,recv_lat_s" << endl;
 }
 
 void TestMRAMThroughput(PIMInterface *interface,
-                        size_t MaxBufferSizePerDPU, int run_number) {
-    const size_t MinTestSizePerDPU = 1 << 10;
-    const size_t MaxTestSizePerDPU = std::min((size_t)1 << 20, MaxBufferSizePerDPU);
+                        const vector<size_t> &testSizes) {
     const double timeLimitPerTest = 2.0;  // 2 seconds
     const double earlyStopTimeLimitPerTest = 1.0;
     const size_t repeatLimitPerTest = 500;
 
     int nrOfDPUs = interface->GetNrOfDPUs();
 
-    size_t buffer_size = MaxBufferSizePerDPU * nrOfDPUs;
-    size_t cacheline_size = 64;
+    // Find max size and allocate buffer accordingly
+    // Add 4KB offset between buffers to avoid cache conflicts
+    const size_t CACHE_OFFSET = 4096;
+    size_t maxBufferSizePerDPU = *max_element(testSizes.begin(), testSizes.end());
+    size_t stridePerDPU = (12800 - 4) << 10;
+    assert(maxBufferSizePerDPU <= stridePerDPU);
+
+    size_t buffer_size = stridePerDPU * nrOfDPUs;
     uint8_t *buffer = (uint8_t *)aligned_alloc(1l << 21, buffer_size);
-    // madvise(buffer, buffer_size, MADV_HUGEPAGE);
 
     uint8_t **dpuBuffer = new uint8_t *[nrOfDPUs];
 
     for (int i = 0; i < nrOfDPUs; i++) {
-        // void *ptr = malloc(MaxBufferSizePerDPU);
-        // aligned_alloc(1l << 21, MaxBufferSizePerDPU);
-        // madvise(ptr, MaxBufferSizePerDPU, MADV_NOHUGEPAGE);
-        // dpuBuffer[i] = (uint8_t *)ptr;
-        dpuBuffer[i] = buffer + i * MaxBufferSizePerDPU;
+        dpuBuffer[i] = buffer + i * stridePerDPU;
     }
 
     auto get_value = [&](size_t i, size_t j, uint64_t repeat) -> uint64_t {
@@ -79,8 +80,7 @@ void TestMRAMThroughput(PIMInterface *interface,
     };
 
     internal_timer send_timer, recv_timer, total_timer;
-    for (size_t bufferSizePerDPU = MinTestSizePerDPU;
-         bufferSizePerDPU <= MaxTestSizePerDPU; bufferSizePerDPU <<= 1) {
+    for (size_t bufferSizePerDPU : testSizes) {
         send_timer.reset();
         recv_timer.reset();
         total_timer.reset();
@@ -158,15 +158,14 @@ void TestMRAMThroughput(PIMInterface *interface,
                     "Size: %5lu KB, Repeat: %6lu, Send Time: %8.3lf s, Recv "
                     "Time: %8.3lf s, Total Time: %8.3lf s, "
                     "Send BW: %8.3lf GB/s, Recv BW: %8.3lf GB/s, Send Lat: %5g s, Recv Lat: %5g s\n",
-                    MaxBufferSizePerDPU / 1024,
+                    maxBufferSizePerDPU / 1024,
                     bufferSizePerDPU / 1024, repeat, send_timer.total_time,
                     recv_timer.total_time, total_timer.total_time,
                     send_bw_gbps, recv_bw_gbps, send_lat, recv_lat);
                 fflush(stdout);
 
                 // CSV output
-                csv_file << run_number << ","
-                         << MaxBufferSizePerDPU / 1024 << ","
+                csv_file << maxBufferSizePerDPU / 1024 << ","
                          << bufferSizePerDPU / 1024 << ","
                          << repeat << ","
                          << send_timer.total_time << ","
@@ -227,12 +226,20 @@ int main(int argc, char **argv) {
     pimInterface->Launch(false);
     pimInterface->PrintLog([](int i) { return (i % 100) == 0; });
 
+    cout << "PIM is running correctly" << endl;
+
     // Open CSV file and write header
     csv_file.open("benchmark_results.csv");
     WriteCSVHeader();
 
-    TestMRAMThroughput(pimInterface, (6400 - 4) << 10, 1);
-    TestMRAMThroughput(pimInterface, (6400 - 4) << 10, 2);
+    // Generate test sizes: 1KB, 2KB, 4KB, ..., 1024KB
+    vector<size_t> testSizes;
+    for (size_t size = 1 << 10; size <= 8 << 20; size <<= 1) {
+        testSizes.push_back(size);
+    }
+
+    // Run benchmark twice
+    TestMRAMThroughput(pimInterface, testSizes);
 
     csv_file.close();
     cout << "Results saved to benchmark_results.csv" << endl;

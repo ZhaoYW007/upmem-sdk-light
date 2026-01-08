@@ -69,7 +69,11 @@ set_target_properties(example PROPERTIES PUBLIC_HEADER ${CMAKE_CURRENT_SOURCE_DI
 
 # dpu part for example
 set(EXAMPLE_DPU_PROGRAM_NAME dpu_example)
-set(UPMEM_C_COMPILER ${UPMEM_SDK_DIR}/bin/dpu-upmem-dpurte-clang)
+# Find DPU compiler - check both SDK dir and system PATH
+find_program(UPMEM_C_COMPILER dpu-upmem-dpurte-clang
+    HINTS ${UPMEM_SDK_DIR}/bin /usr/bin
+    REQUIRED)
+message(STATUS "DPU compiler: ${UPMEM_C_COMPILER}")
 
 if(NOT NR_TASKLETS)
   set(NR_TASKLETS 12)
@@ -98,7 +102,6 @@ set_target_properties(benchmark PROPERTIES PUBLIC_HEADER ${CMAKE_CURRENT_SOURCE_
 
 # dpu part for benchmark
 set(BENCHMARK_DPU_PROGRAM_NAME dpu_benchmark)
-set(UPMEM_C_COMPILER ${UPMEM_SDK_DIR}/bin/dpu-upmem-dpurte-clang)
 
 if(NOT NR_TASKLETS)
   set(NR_TASKLETS 12)

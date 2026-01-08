@@ -56,6 +56,10 @@ dkms.conf
 .vscode
 .DS_Store
 
+# benchmark results and plots
+results/
+plot/
+
 # emacs
 *~
 \#*\#
