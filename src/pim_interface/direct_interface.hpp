@@ -162,7 +162,8 @@ class DirectPIMInterface : public PIMInterface {
                              uint8_t *ptr_dest, uint32_t length,
                              double &out_pre_flush, double &out_read,
                              double &out_post_flush,
-                             double out_read_per_dpuid[4]) {
+                             double out_read_per_dpuid[4],
+                             double &out_load_frac, double &out_scatter_frac) {
         assert(aligned(symbol_offset, sizeof(uint64_t)));
         assert(aligned(length, sizeof(uint64_t)));
         assert((uint64_t)symbol_offset + length <= MRAM_SIZE);
@@ -204,6 +205,8 @@ class DirectPIMInterface : public PIMInterface {
                                                     7 * sizeof(uint64_t)));
         };
 
+        uint64_t cyc_load = 0, cyc_scatter = 0;
+
         for (uint32_t dpu_id = 0; dpu_id < 4; ++dpu_id) {
             double t_dpuid = get_time();
             for (uint32_t i = 0; i < length / sizeof(uint64_t); ++i) {
@@ -221,10 +224,13 @@ class DirectPIMInterface : public PIMInterface {
                     __builtin_prefetch(ptr_dest + offset_prefetch);
                     __builtin_prefetch(ptr_dest + offset_prefetch + 0x40);
                 }
-                // __builtin_prefetch(ptr_dest + offset + 0x40 * 6);
-                // __builtin_prefetch(ptr_dest + offset + 0x40 * 7);
 
+                bool sample = ((i & 31) == 0);
+                uint64_t c0, c1, c2, c3, c4;
+
+                if (sample) c0 = __rdtsc();
                 LoadData(cache_line, ptr_dest + offset);
+                if (sample) c1 = __rdtsc();
                 byte_interleave_avx512(cache_line, cache_line_interleave, false);
                 for (int j = 0; j < 8; j++) {
                     if (buffers[j * 8 + dpu_id] == nullptr) {
@@ -233,9 +239,11 @@ class DirectPIMInterface : public PIMInterface {
                     *(((uint64_t *)buffers[j * 8 + dpu_id]) + i) =
                         cache_line_interleave[j];
                 }
+                if (sample) c2 = __rdtsc();
 
                 offset += 0x40;
                 LoadData(cache_line, ptr_dest + offset);
+                if (sample) c3 = __rdtsc();
                 byte_interleave_avx512(cache_line, cache_line_interleave, false);
                 for (int j = 0; j < 8; j++) {
                     if (buffers[j * 8 + dpu_id + 4] == nullptr) {
@@ -243,6 +251,11 @@ class DirectPIMInterface : public PIMInterface {
                     }
                     *(((uint64_t *)buffers[j * 8 + dpu_id + 4]) + i) =
                         cache_line_interleave[j];
+                }
+                if (sample) {
+                    c4 = __rdtsc();
+                    cyc_load += (c1 - c0) + (c3 - c2);
+                    cyc_scatter += (c2 - c1) + (c4 - c3);
                 }
             }
             out_read_per_dpuid[dpu_id] = get_time() - t_dpuid;
@@ -267,17 +280,22 @@ class DirectPIMInterface : public PIMInterface {
         out_pre_flush = t1 - t0;
         out_read = t2 - t1;
         out_post_flush = t3 - t2;
+        uint64_t cyc_total = cyc_load + cyc_scatter;
+        out_load_frac = cyc_total > 0 ? (double)cyc_load / cyc_total : 0;
+        out_scatter_frac = cyc_total > 0 ? (double)cyc_scatter / cyc_total : 0;
     }
 
     void SendToRankMRAM(uint8_t **buffers, uint32_t symbol_offset,
                         uint8_t *ptr_dest, uint32_t length,
                         double &out_write, double &out_fence,
-                        double out_write_per_dpuid[4]) {
+                        double out_write_per_dpuid[4],
+                        double &out_gather_frac, double &out_store_frac) {
         assert(aligned(symbol_offset, sizeof(uint64_t)));
         assert(aligned(length, sizeof(uint64_t)));
         assert((uint64_t)symbol_offset + length <= MRAM_SIZE);
 
         uint64_t cache_line[8];
+        uint64_t cyc_gather = 0, cyc_store = 0;
 
         double t0 = get_time();
 
@@ -293,6 +311,10 @@ class DirectPIMInterface : public PIMInterface {
                 uint64_t offset =
                     GetCorrectOffsetMRAM(symbol_offset + (i * 8), dpu_id);
 
+                bool sample = ((i & 31) == 0);
+                uint64_t c0, c1, c2, c3, c4;
+
+                if (sample) c0 = __rdtsc();
                 for (int j = 0; j < 8; j++) {
                     if (buffers[j * 8 + dpu_id] == nullptr) {
                         continue;
@@ -300,8 +322,10 @@ class DirectPIMInterface : public PIMInterface {
                     cache_line[j] =
                         *(((uint64_t *)buffers[j * 8 + dpu_id]) + i);
                 }
+                if (sample) c1 = __rdtsc();
                 byte_interleave_avx512(cache_line,
                                        (uint64_t *)(ptr_dest + offset), true);
+                if (sample) c2 = __rdtsc();
 
                 offset += 0x40;
                 for (int j = 0; j < 8; j++) {
@@ -311,8 +335,14 @@ class DirectPIMInterface : public PIMInterface {
                     cache_line[j] =
                         *(((uint64_t *)buffers[j * 8 + dpu_id + 4]) + i);
                 }
+                if (sample) c3 = __rdtsc();
                 byte_interleave_avx512(cache_line,
                                        (uint64_t *)(ptr_dest + offset), true);
+                if (sample) {
+                    c4 = __rdtsc();
+                    cyc_gather += (c1 - c0) + (c3 - c2);
+                    cyc_store += (c2 - c1) + (c4 - c3);
+                }
             }
             out_write_per_dpuid[dpu_id] = get_time() - t_dpuid;
         }
@@ -323,6 +353,9 @@ class DirectPIMInterface : public PIMInterface {
 
         out_write = t1 - t0;
         out_fence = t2 - t1;
+        uint64_t cyc_total = cyc_gather + cyc_store;
+        out_gather_frac = cyc_total > 0 ? (double)cyc_gather / cyc_total : 0;
+        out_store_frac = cyc_total > 0 ? (double)cyc_store / cyc_total : 0;
     }
 
     bool DirectAvailable(bool async_transfer) {
@@ -413,6 +446,7 @@ class DirectPIMInterface : public PIMInterface {
         double align = 0, parallel = 0;
         double mux_max = 0, write_max = 0, fence_max = 0;
         double write_dpuid_max[4] = {};
+        double gather_frac = 0, store_frac = 0;
         int calls = 0;
         void reset() { *this = {}; }
     } send_timing;
@@ -421,6 +455,7 @@ class DirectPIMInterface : public PIMInterface {
         double align = 0, parallel = 0;
         double mux_max = 0, pre_flush_max = 0, read_max = 0, post_flush_max = 0;
         double read_dpuid_max[4] = {};
+        double load_frac = 0, scatter_frac = 0;
         int calls = 0;
         void reset() { *this = {}; }
     } recv_timing;
@@ -433,11 +468,14 @@ class DirectPIMInterface : public PIMInterface {
                    n, send_timing.align / n, send_timing.parallel / n,
                    send_timing.mux_max / n, send_timing.write_max / n,
                    send_timing.fence_max / n);
-            printf("    write_per_dpuid_max: [%.6f %.6f %.6f %.6f]\n",
+            printf("    write_per_dpuid_max: [%.6f %.6f %.6f %.6f]"
+                   " | gather=%.1f%% interleave+store=%.1f%%\n",
                    send_timing.write_dpuid_max[0] / n,
                    send_timing.write_dpuid_max[1] / n,
                    send_timing.write_dpuid_max[2] / n,
-                   send_timing.write_dpuid_max[3] / n);
+                   send_timing.write_dpuid_max[3] / n,
+                   send_timing.gather_frac / n * 100,
+                   send_timing.store_frac / n * 100);
         }
         if (recv_timing.calls > 0) {
             int n = recv_timing.calls;
@@ -446,11 +484,14 @@ class DirectPIMInterface : public PIMInterface {
                    n, recv_timing.align / n, recv_timing.parallel / n,
                    recv_timing.mux_max / n, recv_timing.pre_flush_max / n,
                    recv_timing.read_max / n, recv_timing.post_flush_max / n);
-            printf("    read_per_dpuid_max: [%.6f %.6f %.6f %.6f]\n",
+            printf("    read_per_dpuid_max: [%.6f %.6f %.6f %.6f]"
+                   " | mram_load=%.1f%% deinterleave+scatter=%.1f%%\n",
                    recv_timing.read_dpuid_max[0] / n,
                    recv_timing.read_dpuid_max[1] / n,
                    recv_timing.read_dpuid_max[2] / n,
-                   recv_timing.read_dpuid_max[3] / n);
+                   recv_timing.read_dpuid_max[3] / n,
+                   recv_timing.load_frac / n * 100,
+                   recv_timing.scatter_frac / n * 100);
         }
         send_timing.reset();
         recv_timing.reset();
@@ -504,7 +545,8 @@ class DirectPIMInterface : public PIMInterface {
         symbol_offset += symbol_base_offset ^ MRAM_ADDRESS_SPACE;
 
         std::vector<double> t_mux(nr_of_ranks), t_pre_flush(nr_of_ranks),
-            t_read(nr_of_ranks), t_post_flush(nr_of_ranks);
+            t_read(nr_of_ranks), t_post_flush(nr_of_ranks),
+            t_load_frac(nr_of_ranks), t_scatter_frac(nr_of_ranks);
         std::vector<std::array<double, 4>> t_read_dpuid(nr_of_ranks);
 
         double t_parallel_start = get_time();
@@ -518,18 +560,22 @@ class DirectPIMInterface : public PIMInterface {
                 ReceiveFromRankMRAM(&buffers[i * MAX_NR_DPUS_PER_RANK],
                                     symbol_offset, base_addrs[i], length,
                                     t_pre_flush[i], t_read[i], t_post_flush[i],
-                                    t_read_dpuid[i].data());
+                                    t_read_dpuid[i].data(),
+                                    t_load_frac[i], t_scatter_frac[i]);
             },
             1, false);
         double t_parallel_total = get_time() - t_parallel_start;
 
         auto max_of = [](const std::vector<double> &v) { return *std::max_element(v.begin(), v.end()); };
+        auto avg_of = [](const std::vector<double> &v) { return std::accumulate(v.begin(), v.end(), 0.0) / v.size(); };
 
         recv_timing.parallel += t_parallel_total;
         recv_timing.mux_max += max_of(t_mux);
         recv_timing.pre_flush_max += max_of(t_pre_flush);
         recv_timing.read_max += max_of(t_read);
         recv_timing.post_flush_max += max_of(t_post_flush);
+        recv_timing.load_frac += avg_of(t_load_frac);
+        recv_timing.scatter_frac += avg_of(t_scatter_frac);
         for (int d = 0; d < 4; d++) {
             double mx = 0;
             for (size_t r = 0; r < nr_of_ranks; r++)
@@ -609,7 +655,7 @@ class DirectPIMInterface : public PIMInterface {
         double t_align = get_time() - t_align_start;
 
         std::vector<double> t_mux(nr_of_ranks), t_write(nr_of_ranks),
-            t_fence(nr_of_ranks);
+            t_fence(nr_of_ranks), t_gather_frac(nr_of_ranks), t_store_frac(nr_of_ranks);
         std::vector<std::array<double, 4>> t_write_dpuid(nr_of_ranks);
 
         double t_parallel_start = get_time();
@@ -623,18 +669,22 @@ class DirectPIMInterface : public PIMInterface {
                 SendToRankMRAM(&buffers_aligned[i * MAX_NR_DPUS_PER_RANK],
                                symbol_offset, base_addrs[i], length,
                                t_write[i], t_fence[i],
-                               t_write_dpuid[i].data());
+                               t_write_dpuid[i].data(),
+                               t_gather_frac[i], t_store_frac[i]);
             },
             1, false);
         double t_parallel_total = get_time() - t_parallel_start;
 
         auto max_of = [](const std::vector<double> &v) { return *std::max_element(v.begin(), v.end()); };
+        auto avg_of = [](const std::vector<double> &v) { return std::accumulate(v.begin(), v.end(), 0.0) / v.size(); };
 
         send_timing.align += t_align;
         send_timing.parallel += t_parallel_total;
         send_timing.mux_max += max_of(t_mux);
         send_timing.write_max += max_of(t_write);
         send_timing.fence_max += max_of(t_fence);
+        send_timing.gather_frac += avg_of(t_gather_frac);
+        send_timing.store_frac += avg_of(t_store_frac);
         for (int d = 0; d < 4; d++) {
             double mx = 0;
             for (size_t r = 0; r < nr_of_ranks; r++)
