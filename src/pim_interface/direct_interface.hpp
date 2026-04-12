@@ -4,6 +4,7 @@
 #include <x86intrin.h>
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <ctime>
 #include <iostream>
@@ -160,7 +161,8 @@ class DirectPIMInterface : public PIMInterface {
     void ReceiveFromRankMRAM(uint8_t **buffers, uint32_t symbol_offset,
                              uint8_t *ptr_dest, uint32_t length,
                              double &out_pre_flush, double &out_read,
-                             double &out_post_flush) {
+                             double &out_post_flush,
+                             double out_read_per_dpuid[4]) {
         assert(aligned(symbol_offset, sizeof(uint64_t)));
         assert(aligned(length, sizeof(uint64_t)));
         assert((uint64_t)symbol_offset + length <= MRAM_SIZE);
@@ -203,6 +205,7 @@ class DirectPIMInterface : public PIMInterface {
         };
 
         for (uint32_t dpu_id = 0; dpu_id < 4; ++dpu_id) {
+            double t_dpuid = get_time();
             for (uint32_t i = 0; i < length / sizeof(uint64_t); ++i) {
                 if ((i % 8 == 0) && (i + 8 < length / sizeof(uint64_t))) {
                     for (int j = 0; j < 16; j++) {
@@ -242,6 +245,7 @@ class DirectPIMInterface : public PIMInterface {
                         cache_line_interleave[j];
                 }
             }
+            out_read_per_dpuid[dpu_id] = get_time() - t_dpuid;
         }
 
         double t2 = get_time();
@@ -267,7 +271,8 @@ class DirectPIMInterface : public PIMInterface {
 
     void SendToRankMRAM(uint8_t **buffers, uint32_t symbol_offset,
                         uint8_t *ptr_dest, uint32_t length,
-                        double &out_write, double &out_fence) {
+                        double &out_write, double &out_fence,
+                        double out_write_per_dpuid[4]) {
         assert(aligned(symbol_offset, sizeof(uint64_t)));
         assert(aligned(length, sizeof(uint64_t)));
         assert((uint64_t)symbol_offset + length <= MRAM_SIZE);
@@ -277,6 +282,7 @@ class DirectPIMInterface : public PIMInterface {
         double t0 = get_time();
 
         for (uint32_t dpu_id = 0; dpu_id < 4; ++dpu_id) {
+            double t_dpuid = get_time();
             for (uint32_t i = 0; i < length / sizeof(uint64_t); ++i) {
                 if ((i % 8 == 0) && (i + 8 < length / sizeof(uint64_t))) {
                     for (int j = 0; j < 16; j++) {
@@ -308,6 +314,7 @@ class DirectPIMInterface : public PIMInterface {
                 byte_interleave_avx512(cache_line,
                                        (uint64_t *)(ptr_dest + offset), true);
             }
+            out_write_per_dpuid[dpu_id] = get_time() - t_dpuid;
         }
 
         double t1 = get_time();
@@ -405,6 +412,7 @@ class DirectPIMInterface : public PIMInterface {
     struct SendTimingAccum {
         double align = 0, parallel = 0;
         double mux_max = 0, write_max = 0, fence_max = 0;
+        double write_dpuid_max[4] = {};
         int calls = 0;
         void reset() { *this = {}; }
     } send_timing;
@@ -412,6 +420,7 @@ class DirectPIMInterface : public PIMInterface {
     struct RecvTimingAccum {
         double align = 0, parallel = 0;
         double mux_max = 0, pre_flush_max = 0, read_max = 0, post_flush_max = 0;
+        double read_dpuid_max[4] = {};
         int calls = 0;
         void reset() { *this = {}; }
     } recv_timing;
@@ -424,6 +433,11 @@ class DirectPIMInterface : public PIMInterface {
                    n, send_timing.align / n, send_timing.parallel / n,
                    send_timing.mux_max / n, send_timing.write_max / n,
                    send_timing.fence_max / n);
+            printf("    write_per_dpuid_max: [%.6f %.6f %.6f %.6f]\n",
+                   send_timing.write_dpuid_max[0] / n,
+                   send_timing.write_dpuid_max[1] / n,
+                   send_timing.write_dpuid_max[2] / n,
+                   send_timing.write_dpuid_max[3] / n);
         }
         if (recv_timing.calls > 0) {
             int n = recv_timing.calls;
@@ -432,6 +446,11 @@ class DirectPIMInterface : public PIMInterface {
                    n, recv_timing.align / n, recv_timing.parallel / n,
                    recv_timing.mux_max / n, recv_timing.pre_flush_max / n,
                    recv_timing.read_max / n, recv_timing.post_flush_max / n);
+            printf("    read_per_dpuid_max: [%.6f %.6f %.6f %.6f]\n",
+                   recv_timing.read_dpuid_max[0] / n,
+                   recv_timing.read_dpuid_max[1] / n,
+                   recv_timing.read_dpuid_max[2] / n,
+                   recv_timing.read_dpuid_max[3] / n);
         }
         send_timing.reset();
         recv_timing.reset();
@@ -486,6 +505,7 @@ class DirectPIMInterface : public PIMInterface {
 
         std::vector<double> t_mux(nr_of_ranks), t_pre_flush(nr_of_ranks),
             t_read(nr_of_ranks), t_post_flush(nr_of_ranks);
+        std::vector<std::array<double, 4>> t_read_dpuid(nr_of_ranks);
 
         double t_parallel_start = get_time();
         parlay::parallel_for(
@@ -497,7 +517,8 @@ class DirectPIMInterface : public PIMInterface {
                 t_mux[i] = t1 - t0;
                 ReceiveFromRankMRAM(&buffers[i * MAX_NR_DPUS_PER_RANK],
                                     symbol_offset, base_addrs[i], length,
-                                    t_pre_flush[i], t_read[i], t_post_flush[i]);
+                                    t_pre_flush[i], t_read[i], t_post_flush[i],
+                                    t_read_dpuid[i].data());
             },
             1, false);
         double t_parallel_total = get_time() - t_parallel_start;
@@ -509,6 +530,12 @@ class DirectPIMInterface : public PIMInterface {
         recv_timing.pre_flush_max += max_of(t_pre_flush);
         recv_timing.read_max += max_of(t_read);
         recv_timing.post_flush_max += max_of(t_post_flush);
+        for (int d = 0; d < 4; d++) {
+            double mx = 0;
+            for (size_t r = 0; r < nr_of_ranks; r++)
+                mx = std::max(mx, t_read_dpuid[r][d]);
+            recv_timing.read_dpuid_max[d] += mx;
+        }
     }
 
     void ReceiveFromPIM(uint8_t **buffers, uint32_t buffer_offset, std::string symbol_name,
@@ -583,6 +610,7 @@ class DirectPIMInterface : public PIMInterface {
 
         std::vector<double> t_mux(nr_of_ranks), t_write(nr_of_ranks),
             t_fence(nr_of_ranks);
+        std::vector<std::array<double, 4>> t_write_dpuid(nr_of_ranks);
 
         double t_parallel_start = get_time();
         parlay::parallel_for(
@@ -594,7 +622,8 @@ class DirectPIMInterface : public PIMInterface {
                 t_mux[i] = t1 - t0;
                 SendToRankMRAM(&buffers_aligned[i * MAX_NR_DPUS_PER_RANK],
                                symbol_offset, base_addrs[i], length,
-                               t_write[i], t_fence[i]);
+                               t_write[i], t_fence[i],
+                               t_write_dpuid[i].data());
             },
             1, false);
         double t_parallel_total = get_time() - t_parallel_start;
@@ -606,6 +635,12 @@ class DirectPIMInterface : public PIMInterface {
         send_timing.mux_max += max_of(t_mux);
         send_timing.write_max += max_of(t_write);
         send_timing.fence_max += max_of(t_fence);
+        for (int d = 0; d < 4; d++) {
+            double mx = 0;
+            for (size_t r = 0; r < nr_of_ranks; r++)
+                mx = std::max(mx, t_write_dpuid[r][d]);
+            send_timing.write_dpuid_max[d] += mx;
+        }
         send_timing.calls++;
     }
 
