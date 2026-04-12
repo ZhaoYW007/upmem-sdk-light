@@ -82,6 +82,8 @@ public:
                                  sync_setup));
     }
 
+    virtual void PrintAndResetTimingStats() {}
+
     virtual ~PIMInterface() {
         if (nr_of_ranks > 0) {
             if(free_dpu_set_when_delete) DPU_ASSERT(dpu_free(dpu_set));

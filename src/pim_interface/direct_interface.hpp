@@ -402,6 +402,41 @@ class DirectPIMInterface : public PIMInterface {
     }
 
    public:
+    struct SendTimingAccum {
+        double align = 0, parallel = 0;
+        double mux_max = 0, write_max = 0, fence_max = 0;
+        int calls = 0;
+        void reset() { *this = {}; }
+    } send_timing;
+
+    struct RecvTimingAccum {
+        double align = 0, parallel = 0;
+        double mux_max = 0, pre_flush_max = 0, read_max = 0, post_flush_max = 0;
+        int calls = 0;
+        void reset() { *this = {}; }
+    } recv_timing;
+
+    void PrintAndResetTimingStats() override {
+        if (send_timing.calls > 0) {
+            int n = send_timing.calls;
+            printf("  [Send x%d avg] align=%.6f parallel=%.6f | "
+                   "mux_max=%.6f write_max=%.6f fence_max=%.6f\n",
+                   n, send_timing.align / n, send_timing.parallel / n,
+                   send_timing.mux_max / n, send_timing.write_max / n,
+                   send_timing.fence_max / n);
+        }
+        if (recv_timing.calls > 0) {
+            int n = recv_timing.calls;
+            printf("  [Recv x%d avg] align=%.6f parallel=%.6f | "
+                   "mux_max=%.6f pre_flush_max=%.6f read_max=%.6f post_flush_max=%.6f\n",
+                   n, recv_timing.align / n, recv_timing.parallel / n,
+                   recv_timing.mux_max / n, recv_timing.pre_flush_max / n,
+                   recv_timing.read_max / n, recv_timing.post_flush_max / n);
+        }
+        send_timing.reset();
+        recv_timing.reset();
+    }
+
     DirectPIMInterface(dpu_set_t dpu_set) : PIMInterface(dpu_set) {
         load_from_dpu_set(this->dpu_set);
     }
@@ -468,16 +503,12 @@ class DirectPIMInterface : public PIMInterface {
         double t_parallel_total = get_time() - t_parallel_start;
 
         auto max_of = [](const std::vector<double> &v) { return *std::max_element(v.begin(), v.end()); };
-        auto avg_of = [](const std::vector<double> &v) { return std::accumulate(v.begin(), v.end(), 0.0) / v.size(); };
 
-        printf("  [RecvMRAM] parallel=%.6f | mux: max=%.6f avg=%.6f | "
-               "pre_flush: max=%.6f avg=%.6f | read: max=%.6f avg=%.6f | "
-               "post_flush: max=%.6f avg=%.6f\n",
-               t_parallel_total,
-               max_of(t_mux), avg_of(t_mux),
-               max_of(t_pre_flush), avg_of(t_pre_flush),
-               max_of(t_read), avg_of(t_read),
-               max_of(t_post_flush), avg_of(t_post_flush));
+        recv_timing.parallel += t_parallel_total;
+        recv_timing.mux_max += max_of(t_mux);
+        recv_timing.pre_flush_max += max_of(t_pre_flush);
+        recv_timing.read_max += max_of(t_read);
+        recv_timing.post_flush_max += max_of(t_post_flush);
     }
 
     void ReceiveFromPIM(uint8_t **buffers, uint32_t buffer_offset, std::string symbol_name,
@@ -511,7 +542,8 @@ class DirectPIMInterface : public PIMInterface {
         if (symbol_base_offset & MRAM_ADDRESS_SPACE) {  // receive from mram
             // Only support heap pointer at present
             assert(symbol_name == DPU_MRAM_HEAP_POINTER_NAME);
-            printf("  [RecvFromPIM] align=%.6f\n", t_align);
+            recv_timing.align += t_align;
+            recv_timing.calls++;
             ReceiveFromMRAM(buffers_aligned, symbol_base_offset, symbol_offset,
                             length, async_transfer);
         } else {  // receive from wram
@@ -568,14 +600,13 @@ class DirectPIMInterface : public PIMInterface {
         double t_parallel_total = get_time() - t_parallel_start;
 
         auto max_of = [](const std::vector<double> &v) { return *std::max_element(v.begin(), v.end()); };
-        auto avg_of = [](const std::vector<double> &v) { return std::accumulate(v.begin(), v.end(), 0.0) / v.size(); };
 
-        printf("  [SendToPIM] align=%.6f parallel=%.6f | mux: max=%.6f avg=%.6f | "
-               "write: max=%.6f avg=%.6f | fence: max=%.6f avg=%.6f\n",
-               t_align, t_parallel_total,
-               max_of(t_mux), avg_of(t_mux),
-               max_of(t_write), avg_of(t_write),
-               max_of(t_fence), avg_of(t_fence));
+        send_timing.align += t_align;
+        send_timing.parallel += t_parallel_total;
+        send_timing.mux_max += max_of(t_mux);
+        send_timing.write_max += max_of(t_write);
+        send_timing.fence_max += max_of(t_fence);
+        send_timing.calls++;
     }
 
     size_t GetNUMAIDOfDPU(size_t dpu_id) {

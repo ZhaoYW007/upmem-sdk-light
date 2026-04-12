@@ -176,6 +176,8 @@ void TestMRAMThroughput(PIMInterface *interface,
                          << send_lat << ","
                          << recv_lat << endl;
 
+                interface->PrintAndResetTimingStats();
+
                 break;
             }
         }
