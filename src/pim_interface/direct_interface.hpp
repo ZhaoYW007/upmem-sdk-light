@@ -3,8 +3,11 @@
 #include <immintrin.h>
 #include <x86intrin.h>
 
+#include <algorithm>
 #include <cinttypes>
+#include <ctime>
 #include <iostream>
+#include <numeric>
 
 #include "pim_interface.hpp"
 #include "parlay/parallel.h"
@@ -148,11 +151,21 @@ class DirectPIMInterface : public PIMInterface {
         return FastPath(address_offset, dpu_id);
     }
 
+    static double get_time() {
+        timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        return ts.tv_sec + ts.tv_nsec / 1e9;
+    }
+
     void ReceiveFromRankMRAM(uint8_t **buffers, uint32_t symbol_offset,
-                             uint8_t *ptr_dest, uint32_t length) {
+                             uint8_t *ptr_dest, uint32_t length,
+                             double &out_pre_flush, double &out_read,
+                             double &out_post_flush) {
         assert(aligned(symbol_offset, sizeof(uint64_t)));
         assert(aligned(length, sizeof(uint64_t)));
         assert((uint64_t)symbol_offset + length <= MRAM_SIZE);
+
+        double t0 = get_time();
 
         for (uint32_t dpu_id = 0; dpu_id < 4; ++dpu_id) {
             for (uint32_t i = 0; i < length / sizeof(uint64_t); ++i) {
@@ -165,7 +178,9 @@ class DirectPIMInterface : public PIMInterface {
             }
         }
         __builtin_ia32_mfence();
-        
+
+        double t1 = get_time();
+
         uint64_t cache_line[8], cache_line_interleave[8];
 
         auto LoadData = [](uint64_t *cache_line, uint8_t *ptr_dest) {
@@ -229,6 +244,8 @@ class DirectPIMInterface : public PIMInterface {
             }
         }
 
+        double t2 = get_time();
+
         for (uint32_t dpu_id = 0; dpu_id < 4; ++dpu_id) {
             for (uint32_t i = 0; i < length / sizeof(uint64_t); ++i) {
                 // 8 shards of DPUs
@@ -240,15 +257,24 @@ class DirectPIMInterface : public PIMInterface {
             }
         }
         __builtin_ia32_mfence();
+
+        double t3 = get_time();
+
+        out_pre_flush = t1 - t0;
+        out_read = t2 - t1;
+        out_post_flush = t3 - t2;
     }
 
     void SendToRankMRAM(uint8_t **buffers, uint32_t symbol_offset,
-                        uint8_t *ptr_dest, uint32_t length) {
+                        uint8_t *ptr_dest, uint32_t length,
+                        double &out_write, double &out_fence) {
         assert(aligned(symbol_offset, sizeof(uint64_t)));
         assert(aligned(length, sizeof(uint64_t)));
         assert((uint64_t)symbol_offset + length <= MRAM_SIZE);
 
         uint64_t cache_line[8];
+
+        double t0 = get_time();
 
         for (uint32_t dpu_id = 0; dpu_id < 4; ++dpu_id) {
             for (uint32_t i = 0; i < length / sizeof(uint64_t); ++i) {
@@ -284,7 +310,12 @@ class DirectPIMInterface : public PIMInterface {
             }
         }
 
+        double t1 = get_time();
         __builtin_ia32_mfence();
+        double t2 = get_time();
+
+        out_write = t1 - t0;
+        out_fence = t2 - t1;
     }
 
     bool DirectAvailable(bool async_transfer) {
@@ -417,21 +448,36 @@ class DirectPIMInterface : public PIMInterface {
         assert(DirectAvailable(async_transfer));
         assert(symbol_base_offset & MRAM_ADDRESS_SPACE);
         symbol_offset += symbol_base_offset ^ MRAM_ADDRESS_SPACE;
-        auto ReceiveFromIthRank = [&](size_t i) {
-            DPU_ASSERT(dpu_switch_mux_for_rank(ranks[i], true));
-            ReceiveFromRankMRAM(&buffers[i * MAX_NR_DPUS_PER_RANK],
-                                symbol_offset, base_addrs[i], length);
-        };
 
+        std::vector<double> t_mux(nr_of_ranks), t_pre_flush(nr_of_ranks),
+            t_read(nr_of_ranks), t_post_flush(nr_of_ranks);
+
+        double t_parallel_start = get_time();
         parlay::parallel_for(
             0, nr_of_ranks,
             [&](size_t i) {
-                ReceiveFromIthRank(i);
+                double t0 = get_time();
+                DPU_ASSERT(dpu_switch_mux_for_rank(ranks[i], true));
+                double t1 = get_time();
+                t_mux[i] = t1 - t0;
+                ReceiveFromRankMRAM(&buffers[i * MAX_NR_DPUS_PER_RANK],
+                                    symbol_offset, base_addrs[i], length,
+                                    t_pre_flush[i], t_read[i], t_post_flush[i]);
             },
             1, false);
-        // for (size_t i = 0; i < nr_of_ranks; i++) {
-        //     ReceiveFromIthRank(i);
-        // }
+        double t_parallel_total = get_time() - t_parallel_start;
+
+        auto max_of = [](const std::vector<double> &v) { return *std::max_element(v.begin(), v.end()); };
+        auto avg_of = [](const std::vector<double> &v) { return std::accumulate(v.begin(), v.end(), 0.0) / v.size(); };
+
+        printf("  [RecvMRAM] parallel=%.6f | mux: max=%.6f avg=%.6f | "
+               "pre_flush: max=%.6f avg=%.6f | read: max=%.6f avg=%.6f | "
+               "post_flush: max=%.6f avg=%.6f\n",
+               t_parallel_total,
+               max_of(t_mux), avg_of(t_mux),
+               max_of(t_pre_flush), avg_of(t_pre_flush),
+               max_of(t_read), avg_of(t_read),
+               max_of(t_post_flush), avg_of(t_post_flush));
     }
 
     void ReceiveFromPIM(uint8_t **buffers, uint32_t buffer_offset, std::string symbol_name,
@@ -440,6 +486,7 @@ class DirectPIMInterface : public PIMInterface {
         // Please make sure buffers don't overflow
         assert(DirectAvailable(async_transfer));
 
+        double t_align_start = get_time();
         uint32_t symbol_base_offset = GetSymbolOffset(symbol_name);
 
         // Skip disabled PIM modules
@@ -459,10 +506,12 @@ class DirectPIMInterface : public PIMInterface {
             }
             assert(offset == nr_of_dpus);
         }
+        double t_align = get_time() - t_align_start;
 
         if (symbol_base_offset & MRAM_ADDRESS_SPACE) {  // receive from mram
             // Only support heap pointer at present
             assert(symbol_name == DPU_MRAM_HEAP_POINTER_NAME);
+            printf("  [RecvFromPIM] align=%.6f\n", t_align);
             ReceiveFromMRAM(buffers_aligned, symbol_base_offset, symbol_offset,
                             length, async_transfer);
         } else {  // receive from wram
@@ -477,6 +526,7 @@ class DirectPIMInterface : public PIMInterface {
         // Please make sure buffers don't overflow
         assert(DirectAvailable(async_transfer));
 
+        double t_align_start = get_time();
         assert(GetSymbolOffset(symbol_name) & MRAM_ADDRESS_SPACE);
         symbol_offset += GetSymbolOffset(symbol_name) ^ MRAM_ADDRESS_SPACE;
 
@@ -497,24 +547,35 @@ class DirectPIMInterface : public PIMInterface {
             }
             assert(offset == nr_of_dpus);
         }
+        double t_align = get_time() - t_align_start;
 
-        auto SendToIthRank = [&](size_t i) {
-            DPU_ASSERT(dpu_switch_mux_for_rank(ranks[i], true));
-            SendToRankMRAM(&buffers_aligned[i * MAX_NR_DPUS_PER_RANK],
-                           symbol_offset, base_addrs[i], length);
-        };
+        std::vector<double> t_mux(nr_of_ranks), t_write(nr_of_ranks),
+            t_fence(nr_of_ranks);
 
+        double t_parallel_start = get_time();
         parlay::parallel_for(
             0, nr_of_ranks,
             [&](size_t i) {
-                SendToIthRank(i);
+                double t0 = get_time();
+                DPU_ASSERT(dpu_switch_mux_for_rank(ranks[i], true));
+                double t1 = get_time();
+                t_mux[i] = t1 - t0;
+                SendToRankMRAM(&buffers_aligned[i * MAX_NR_DPUS_PER_RANK],
+                               symbol_offset, base_addrs[i], length,
+                               t_write[i], t_fence[i]);
             },
             1, false);
+        double t_parallel_total = get_time() - t_parallel_start;
 
-        // Find physical address for each rank
-        // for (uint32_t i = 0; i < nr_of_ranks; i++) {
-        //     SendToIthRank(i);
-        // }
+        auto max_of = [](const std::vector<double> &v) { return *std::max_element(v.begin(), v.end()); };
+        auto avg_of = [](const std::vector<double> &v) { return std::accumulate(v.begin(), v.end(), 0.0) / v.size(); };
+
+        printf("  [SendToPIM] align=%.6f parallel=%.6f | mux: max=%.6f avg=%.6f | "
+               "write: max=%.6f avg=%.6f | fence: max=%.6f avg=%.6f\n",
+               t_align, t_parallel_total,
+               max_of(t_mux), avg_of(t_mux),
+               max_of(t_write), avg_of(t_write),
+               max_of(t_fence), avg_of(t_fence));
     }
 
     size_t GetNUMAIDOfDPU(size_t dpu_id) {
