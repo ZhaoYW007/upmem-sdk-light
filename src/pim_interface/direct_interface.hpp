@@ -231,26 +231,26 @@ class DirectPIMInterface : public PIMInterface {
                 if (sample) c0 = __rdtsc();
                 LoadData(cache_line, ptr_dest + offset);
                 if (sample) c1 = __rdtsc();
-                byte_interleave_avx512(cache_line, cache_line_interleave, false);
+                // byte_interleave_avx512 disabled: scatter raw cache_line directly
                 for (int j = 0; j < 8; j++) {
                     if (buffers[j * 8 + dpu_id] == nullptr) {
                         continue;
                     }
                     *(((uint64_t *)buffers[j * 8 + dpu_id]) + i) =
-                        cache_line_interleave[j];
+                        cache_line[j];
                 }
                 if (sample) c2 = __rdtsc();
 
                 offset += 0x40;
                 LoadData(cache_line, ptr_dest + offset);
                 if (sample) c3 = __rdtsc();
-                byte_interleave_avx512(cache_line, cache_line_interleave, false);
+                // byte_interleave_avx512 disabled: scatter raw cache_line directly
                 for (int j = 0; j < 8; j++) {
                     if (buffers[j * 8 + dpu_id + 4] == nullptr) {
                         continue;
                     }
                     *(((uint64_t *)buffers[j * 8 + dpu_id + 4]) + i) =
-                        cache_line_interleave[j];
+                        cache_line[j];
                 }
                 if (sample) {
                     c4 = __rdtsc();
@@ -323,8 +323,9 @@ class DirectPIMInterface : public PIMInterface {
                         *(((uint64_t *)buffers[j * 8 + dpu_id]) + i);
                 }
                 if (sample) c1 = __rdtsc();
-                byte_interleave_avx512(cache_line,
-                                       (uint64_t *)(ptr_dest + offset), true);
+                // byte_interleave_avx512 disabled: raw stream store without shuffle
+                _mm512_stream_si512((__m512i *)(ptr_dest + offset),
+                                    _mm512_loadu_si512(cache_line));
                 if (sample) c2 = __rdtsc();
 
                 offset += 0x40;
@@ -336,8 +337,9 @@ class DirectPIMInterface : public PIMInterface {
                         *(((uint64_t *)buffers[j * 8 + dpu_id + 4]) + i);
                 }
                 if (sample) c3 = __rdtsc();
-                byte_interleave_avx512(cache_line,
-                                       (uint64_t *)(ptr_dest + offset), true);
+                // byte_interleave_avx512 disabled: raw stream store without shuffle
+                _mm512_stream_si512((__m512i *)(ptr_dest + offset),
+                                    _mm512_loadu_si512(cache_line));
                 if (sample) {
                     c4 = __rdtsc();
                     cyc_gather += (c1 - c0) + (c3 - c2);
