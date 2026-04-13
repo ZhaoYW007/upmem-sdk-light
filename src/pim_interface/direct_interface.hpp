@@ -287,9 +287,9 @@ class DirectPIMInterface : public PIMInterface {
         out_scatter_frac = cyc_total > 0 ? (double)cyc_scatter / cyc_total : 0;
     }
 
-    // Row-sorted access: pre-compute physical addresses, sort by row (1KB),
-    // process each row contiguously to maximize row buffer hits.
-    // dpu_id outer (one bank at a time) since row reuse is per-bank.
+    // Original: dpu_id outer, i inner — sequential access per bank.
+    // Row-sorted access was tested and showed no improvement (closed-page
+    // confirmed: MC does not keep rows open for WC streaming stores).
     void SendToRankMRAM(uint8_t **buffers, uint32_t symbol_offset,
                         uint8_t *ptr_dest, uint32_t length,
                         double &out_write, double &out_fence,
@@ -299,25 +299,6 @@ class DirectPIMInterface : public PIMInterface {
         assert(aligned(length, sizeof(uint64_t)));
         assert((uint64_t)symbol_offset + length <= MRAM_SIZE);
 
-        uint32_t n_words = length / sizeof(uint64_t);
-
-        // Pre-compute physical offsets and build row-sorted permutation.
-        // Use dpu_id=0 for offset computation (row structure is the same
-        // for all dpu_ids, just shifted by dpu_id<<18).
-        struct AddrEntry {
-            uint32_t i;        // original word index
-            uint64_t offset;   // physical offset (without dpu_id component)
-        };
-        parlay::sequence<AddrEntry> sorted(n_words);
-        parlay::parallel_for(0, n_words, [&](uint32_t i) {
-            sorted[i].i = i;
-            sorted[i].offset = GetCorrectOffsetMRAM(symbol_offset + (i * 8), 0)
-                               & ~(uint64_t)(0x3 << 18); // mask out dpu_id bits
-        });
-        // Parallel integer sort by physical offset
-        parlay::integer_sort_inplace(sorted,
-            [](const AddrEntry &e) { return e.offset; });
-
         uint64_t cache_line[8];
         uint64_t cyc_gather = 0, cyc_store = 0;
 
@@ -325,27 +306,19 @@ class DirectPIMInterface : public PIMInterface {
 
         for (uint32_t dpu_id = 0; dpu_id < 4; ++dpu_id) {
             double t_dpuid = get_time();
-            uint64_t dpu_id_offset = (uint64_t)dpu_id << 18;
-
-            for (uint32_t k = 0; k < n_words; ++k) {
-                uint32_t i = sorted[k].i;
-
-                // Prefetch host buffers (every 8 sorted entries)
-                if ((k % 8 == 0) && (k + 8 < n_words)) {
-                    uint32_t i_next = sorted[k + 8].i;
+            for (uint32_t i = 0; i < length / sizeof(uint64_t); ++i) {
+                if ((i % 8 == 0) && (i + 8 < length / sizeof(uint64_t))) {
                     for (int j = 0; j < 16; j++) {
                         __builtin_prefetch(
-                            ((uint64_t *)buffers[j * 4 + dpu_id]) + i_next);
+                            ((uint64_t *)buffers[j * 4 + dpu_id]) + i + 8);
                     }
                 }
-
                 uint64_t offset =
                     GetCorrectOffsetMRAM(symbol_offset + (i * 8), dpu_id);
 
-                bool sample = ((k & 31) == 0);
-                uint64_t c0, c1, c2;
+                bool sample = ((i & 31) == 0);
+                uint64_t c0, c1, c2, c3, c4;
 
-                // First group of 8 DPUs
                 if (sample) c0 = __rdtsc();
                 for (int j = 0; j < 8; j++) {
                     if (buffers[j * 8 + dpu_id] == nullptr) continue;
@@ -355,27 +328,21 @@ class DirectPIMInterface : public PIMInterface {
                 if (sample) c1 = __rdtsc();
                 byte_interleave_avx512(cache_line,
                                        (uint64_t *)(ptr_dest + offset), true);
-                if (sample) {
-                    c2 = __rdtsc();
-                    cyc_gather += c1 - c0;
-                    cyc_store += c2 - c1;
-                }
+                if (sample) c2 = __rdtsc();
 
-                // Second group of 8 DPUs
                 offset += 0x40;
-                if (sample) c0 = __rdtsc();
                 for (int j = 0; j < 8; j++) {
                     if (buffers[j * 8 + dpu_id + 4] == nullptr) continue;
                     cache_line[j] =
                         *(((uint64_t *)buffers[j * 8 + dpu_id + 4]) + i);
                 }
-                if (sample) c1 = __rdtsc();
+                if (sample) c3 = __rdtsc();
                 byte_interleave_avx512(cache_line,
                                        (uint64_t *)(ptr_dest + offset), true);
                 if (sample) {
-                    c2 = __rdtsc();
-                    cyc_gather += c1 - c0;
-                    cyc_store += c2 - c1;
+                    c4 = __rdtsc();
+                    cyc_gather += (c1 - c0) + (c3 - c2);
+                    cyc_store += (c2 - c1) + (c4 - c3);
                 }
             }
             out_write_per_dpuid[dpu_id] = get_time() - t_dpuid;
