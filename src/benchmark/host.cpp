@@ -103,8 +103,7 @@ void TestMRAMThroughput(PIMInterface *interface,
             
             send_timer.end();
 
-            // Launch disabled: byte_interleave is skipped, DPU would see garbage
-            // interface->Launch(false);
+            interface->Launch(false);
             parlay::parallel_for(0, nrOfDPUs, [&](size_t i) {
                 parlay::parallel_for(0, bufferSizePerDPU / 8, [&](size_t j) {
                     uint64_t* ptr = (uint64_t*)(dpuBuffer[i] + j * 8);
@@ -118,17 +117,17 @@ void TestMRAMThroughput(PIMInterface *interface,
                                       bufferSizePerDPU, false);
             recv_timer.end();
 
-            // Verification disabled: byte_interleave is skipped, data is not deinterleaved
-            // parlay::parallel_for(0, nrOfDPUs, [&](size_t i) {
-            //     parlay::parallel_for(0, bufferSizePerDPU / 8, [&](size_t j) {
-            //         uint64_t* ptr = (uint64_t*)(dpuBuffer[i] + j * 8);
-            //         if (j % 256 == 0) {
-            //             assert(*ptr == get_value(i, j, repeat) + ((i << 48) + j));
-            //         } else {
-            //             assert(*ptr == get_value(i, j, repeat));
-            //         }
-            //     });
-            // });
+            parlay::parallel_for(0, nrOfDPUs, [&](size_t i) {
+                parlay::parallel_for(0, bufferSizePerDPU / 8, [&](size_t j) {
+                    uint64_t* ptr = (uint64_t*)(dpuBuffer[i] + j * 8);
+                    if (j % 256 == 0) {
+                        assert(*ptr == get_value(i, j, repeat) + ((i << 48) + j));
+                    } else {
+                        assert(*ptr == get_value(i, j, repeat));
+                    }
+
+                });
+            });
 
             if ((send_timer.total_time >= timeLimitPerTest &&
                  recv_timer.total_time >= timeLimitPerTest) ||

@@ -231,26 +231,26 @@ class DirectPIMInterface : public PIMInterface {
                 if (sample) c0 = __rdtsc();
                 LoadData(cache_line, ptr_dest + offset);
                 if (sample) c1 = __rdtsc();
-                // byte_interleave_avx512 disabled: scatter raw cache_line directly
+                byte_interleave_avx512(cache_line, cache_line_interleave, false);
                 for (int j = 0; j < 8; j++) {
                     if (buffers[j * 8 + dpu_id] == nullptr) {
                         continue;
                     }
                     *(((uint64_t *)buffers[j * 8 + dpu_id]) + i) =
-                        cache_line[j];
+                        cache_line_interleave[j];
                 }
                 if (sample) c2 = __rdtsc();
 
                 offset += 0x40;
                 LoadData(cache_line, ptr_dest + offset);
                 if (sample) c3 = __rdtsc();
-                // byte_interleave_avx512 disabled: scatter raw cache_line directly
+                byte_interleave_avx512(cache_line, cache_line_interleave, false);
                 for (int j = 0; j < 8; j++) {
                     if (buffers[j * 8 + dpu_id + 4] == nullptr) {
                         continue;
                     }
                     *(((uint64_t *)buffers[j * 8 + dpu_id + 4]) + i) =
-                        cache_line[j];
+                        cache_line_interleave[j];
                 }
                 if (sample) {
                     c4 = __rdtsc();
@@ -285,6 +285,13 @@ class DirectPIMInterface : public PIMInterface {
         out_scatter_frac = cyc_total > 0 ? (double)cyc_scatter / cyc_total : 0;
     }
 
+    // Original: dpu_id outer, i inner — sequential writes to same bank path
+    // void SendToRankMRAM_original(...) { ... }
+
+    // Optimized: i outer, dpu_id inner — interleave writes across 4 bank
+    // paths (dpu_ids are 256KB apart in the address space) to enable
+    // device-level bank parallelism. Each iteration fires 8 stream stores
+    // to 4 different bank regions instead of hammering one region.
     void SendToRankMRAM(uint8_t **buffers, uint32_t symbol_offset,
                         uint8_t *ptr_dest, uint32_t length,
                         double &out_write, double &out_fence,
@@ -299,55 +306,59 @@ class DirectPIMInterface : public PIMInterface {
 
         double t0 = get_time();
 
-        for (uint32_t dpu_id = 0; dpu_id < 4; ++dpu_id) {
-            double t_dpuid = get_time();
-            for (uint32_t i = 0; i < length / sizeof(uint64_t); ++i) {
-                if ((i % 8 == 0) && (i + 8 < length / sizeof(uint64_t))) {
-                    for (int j = 0; j < 16; j++) {
-                        __builtin_prefetch(
-                            ((uint64_t *)buffers[j * 4 + dpu_id]) + i + 8);
-                    }
+        for (uint32_t i = 0; i < length / sizeof(uint64_t); ++i) {
+            // Prefetch host buffers for all 64 DPUs
+            if ((i % 8 == 0) && (i + 8 < length / sizeof(uint64_t))) {
+                for (int j = 0; j < 64; j++) {
+                    if (buffers[j] != nullptr)
+                        __builtin_prefetch(((uint64_t *)buffers[j]) + i + 8);
                 }
+            }
+
+            bool sample = ((i & 31) == 0);
+            uint64_t c0, c1, c2;
+
+            for (uint32_t dpu_id = 0; dpu_id < 4; ++dpu_id) {
                 uint64_t offset =
                     GetCorrectOffsetMRAM(symbol_offset + (i * 8), dpu_id);
 
-                bool sample = ((i & 31) == 0);
-                uint64_t c0, c1, c2, c3, c4;
-
+                // First group of 8 DPUs
                 if (sample) c0 = __rdtsc();
                 for (int j = 0; j < 8; j++) {
-                    if (buffers[j * 8 + dpu_id] == nullptr) {
-                        continue;
-                    }
+                    if (buffers[j * 8 + dpu_id] == nullptr) continue;
                     cache_line[j] =
                         *(((uint64_t *)buffers[j * 8 + dpu_id]) + i);
                 }
                 if (sample) c1 = __rdtsc();
-                // byte_interleave_avx512 disabled: raw stream store without shuffle
-                _mm512_stream_si512((__m512i *)(ptr_dest + offset),
-                                    _mm512_loadu_si512(cache_line));
-                if (sample) c2 = __rdtsc();
+                byte_interleave_avx512(cache_line,
+                                       (uint64_t *)(ptr_dest + offset), true);
+                if (sample) {
+                    c2 = __rdtsc();
+                    cyc_gather += c1 - c0;
+                    cyc_store += c2 - c1;
+                }
 
+                // Second group of 8 DPUs
                 offset += 0x40;
+                if (sample) c0 = __rdtsc();
                 for (int j = 0; j < 8; j++) {
-                    if (buffers[j * 8 + dpu_id + 4] == nullptr) {
-                        continue;
-                    }
+                    if (buffers[j * 8 + dpu_id + 4] == nullptr) continue;
                     cache_line[j] =
                         *(((uint64_t *)buffers[j * 8 + dpu_id + 4]) + i);
                 }
-                if (sample) c3 = __rdtsc();
-                // byte_interleave_avx512 disabled: raw stream store without shuffle
-                _mm512_stream_si512((__m512i *)(ptr_dest + offset),
-                                    _mm512_loadu_si512(cache_line));
+                if (sample) c1 = __rdtsc();
+                byte_interleave_avx512(cache_line,
+                                       (uint64_t *)(ptr_dest + offset), true);
                 if (sample) {
-                    c4 = __rdtsc();
-                    cyc_gather += (c1 - c0) + (c3 - c2);
-                    cyc_store += (c2 - c1) + (c4 - c3);
+                    c2 = __rdtsc();
+                    cyc_gather += c1 - c0;
+                    cyc_store += c2 - c1;
                 }
             }
-            out_write_per_dpuid[dpu_id] = get_time() - t_dpuid;
         }
+
+        // Per-dpuid timing not applicable with interleaved loop
+        for (int d = 0; d < 4; d++) out_write_per_dpuid[d] = 0;
 
         double t1 = get_time();
         __builtin_ia32_mfence();
