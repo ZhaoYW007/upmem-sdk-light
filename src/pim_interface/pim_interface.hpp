@@ -104,6 +104,8 @@ public:
 
     uint32_t GetNrOfDPUs() const { return nr_of_dpus; }
 
+    dpu_set_t GetDpuSet() const { return dpu_set; }
+
     void do_not_free_dpu_set_when_delete() { free_dpu_set_when_delete = false; }
 
 protected:

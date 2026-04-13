@@ -13,10 +13,77 @@
 #include "common.h"
 #include "pim_interface_header.hpp"
 #include "timer.hpp"
+
+extern "C" {
+#include <dpu_bank_interface_pmc.h>
+}
+
 using namespace std;
 
 // Global CSV file stream
 ofstream csv_file;
+
+// Measure host row activations during a transfer using Bank Interface PMC.
+// Configures one DPU (DPU 0) to count HOST_ACTIVATE_COMMAND and CYCLES.
+void TestRowActivations(PIMInterface *interface, dpu_set_t dpu_set,
+                        const vector<size_t> &testSizes) {
+    int nrOfDPUs = interface->GetNrOfDPUs();
+
+    size_t maxSize = *max_element(testSizes.begin(), testSizes.end());
+    size_t stridePerDPU = (12800 - 4) << 10;
+    uint8_t *buffer = (uint8_t *)aligned_alloc(1l << 21, stridePerDPU * nrOfDPUs);
+    uint8_t **dpuBuffer = new uint8_t *[nrOfDPUs];
+    for (int i = 0; i < nrOfDPUs; i++)
+        dpuBuffer[i] = buffer + i * stridePerDPU;
+
+    // Get a handle to DPU 0 for PMC
+    dpu_set_t dpu0;
+    uint32_t each_dpu;
+    DPU_FOREACH(dpu_set, dpu0, each_dpu) {
+        if (each_dpu == 0) break;
+    }
+
+    printf("=== Row Activation Count (Bank Interface PMC on DPU 0) ===\n");
+    printf("%12s %16s %16s %16s %12s\n",
+           "BufferKB", "Activations", "Cycles",
+           "ExpectedCLs", "Act/CL ratio");
+
+    for (size_t bufferSize : testSizes) {
+        // Fill buffer
+        parlay::parallel_for(0, nrOfDPUs, [&](size_t i) {
+            memset(dpuBuffer[i], 0x42, bufferSize);
+        });
+
+        // Configure PMC: counter1 = HOST_ACTIVATE_COMMAND, counter2 = CYCLES
+        bank_interface_pmc_config_t config;
+        config.mode = BANK_INTERFACE_PMC_32BIT_MODE;
+        config.counter_1 = BANK_INTERFACE_PMC_HOST_ACTIVATE_COMMAND;
+        config.counter_2 = BANK_INTERFACE_PMC_CYCLES;
+        DPU_ASSERT(dpu_bank_interface_pmc_enable(dpu0, config));
+
+        // Do the transfer
+        interface->SendToPIM(dpuBuffer, 0, DPU_MRAM_HEAP_POINTER_NAME, 0,
+                             bufferSize, false);
+
+        // Stop and read counters
+        DPU_ASSERT(dpu_bank_interface_pmc_stop_counters(dpu0));
+        bank_interface_pmc_result_t result;
+        DPU_ASSERT(dpu_bank_interface_pmc_read_counters(dpu0, &result));
+        DPU_ASSERT(dpu_bank_interface_pmc_disable(dpu0));
+
+        uint32_t activations = result.two_32bits.counter_1;
+        uint32_t cycles = result.two_32bits.counter_2;
+        // Expected cache lines for this DPU: bufferSize / 8 bytes per DPU per CL
+        size_t expected_cls = bufferSize / 8;
+        double ratio = expected_cls > 0 ? (double)activations / expected_cls : 0;
+
+        printf("%12zu %16u %16u %16zu %12.4f\n",
+               bufferSize / 1024, activations, cycles, expected_cls, ratio);
+    }
+
+    delete[] dpuBuffer;
+    free(buffer);
+}
 
 enum CommunicationDirection { Host2PIM = 0, PIM2Host = 1 };
 
@@ -299,6 +366,9 @@ int main(int argc, char **argv) {
         TestMRAMThroughput(pimInterface, testSizes);
         csv_file.close();
         cout << "Results saved to benchmark_results.csv" << endl;
+
+        // Row activation measurement
+        TestRowActivations(pimInterface, pimInterface->GetDpuSet(), testSizes);
     }
 
     for (int i = 0; i < nrOfDPUs; i++) {
