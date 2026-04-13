@@ -59,7 +59,11 @@ void TestRowActivations(PIMInterface *interface, dpu_set_t dpu_set,
         config.mode = BANK_INTERFACE_PMC_32BIT_MODE;
         config.counter_1 = BANK_INTERFACE_PMC_HOST_ACTIVATE_COMMAND;
         config.counter_2 = BANK_INTERFACE_PMC_CYCLES;
-        DPU_ASSERT(dpu_bank_interface_pmc_enable(dpu0, config));
+        dpu_error_t err = dpu_bank_interface_pmc_enable(dpu0, config);
+        if (err != DPU_OK) {
+            printf("Bank Interface PMC not available on this hardware (v1A DPUs lack this feature).\n");
+            break;
+        }
 
         // Do the transfer
         interface->SendToPIM(dpuBuffer, 0, DPU_MRAM_HEAP_POINTER_NAME, 0,
