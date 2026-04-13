@@ -25,7 +25,8 @@ void parse_arguments(int argc, char **argv, int &nr_ranks,
     if (argc < 3) {
         fprintf(
             stderr,
-            "Usage: %s <nr_ranks> <Interface Type>\n",
+            "Usage: %s <nr_ranks> <Interface Type>\n"
+            "  Interface Types: direct, UPMEM, broadcast\n",
             argv[0]);
         exit(1);
     }
@@ -33,10 +34,11 @@ void parse_arguments(int argc, char **argv, int &nr_ranks,
     sscanf(argv[1], "%d", &nr_ranks);
     interfaceType = argv[2];
 
-    if (interfaceType != "direct" && interfaceType != "UPMEM") {
+    if (interfaceType != "direct" && interfaceType != "UPMEM" &&
+        interfaceType != "broadcast") {
         fprintf(stderr,
-                "Invalid interface type. Please enter either 'direct' or "
-                "'UPMEM'.\n");
+                "Invalid interface type. Please enter 'direct', 'UPMEM', "
+                "or 'broadcast'.\n");
         exit(1);
     }
 }
@@ -44,6 +46,61 @@ void parse_arguments(int argc, char **argv, int &nr_ranks,
 void WriteCSVHeader() {
     csv_file << "total_buffer_kb,test_buffer_kb,repeat,send_time_s,recv_time_s,"
              << "total_time_s,send_bw_gbps,recv_bw_gbps,send_lat_s,recv_lat_s" << endl;
+}
+
+void TestBroadcastThroughput(PIMInterface *interface,
+                             const vector<size_t> &testSizes) {
+    const double timeLimitPerTest = 2.0;
+    const double earlyStopTimeLimitPerTest = 1.0;
+    const size_t repeatLimitPerTest = 500;
+
+    int nrOfDPUs = interface->GetNrOfDPUs();
+
+    size_t maxBufferSize = *max_element(testSizes.begin(), testSizes.end());
+    uint8_t *broadcastBuffer = (uint8_t *)aligned_alloc(1l << 21, maxBufferSize);
+
+    internal_timer send_timer, total_timer;
+    for (size_t bufferSize : testSizes) {
+        send_timer.reset();
+        total_timer.reset();
+        total_timer.start();
+        assert(bufferSize % 8 == 0);
+
+        for (size_t repeat = 0; true; repeat++) {
+            // Fill broadcast buffer with deterministic data
+            parlay::parallel_for(0, bufferSize / 8, [&](size_t j) {
+                uint64_t *ptr = (uint64_t *)(broadcastBuffer + j * 8);
+                *ptr = parlay::hash64((j << 20) | repeat);
+            });
+
+            send_timer.start();
+            interface->BroadcastToPIM(broadcastBuffer, DPU_MRAM_HEAP_POINTER_NAME,
+                                      0, bufferSize, false);
+            send_timer.end();
+
+            if (send_timer.total_time >= timeLimitPerTest ||
+                (send_timer.total_time >= earlyStopTimeLimitPerTest &&
+                 repeat >= repeatLimitPerTest)) {
+                total_timer.end();
+
+                double bandwidth = (double)bufferSize * repeat *
+                                   nrOfDPUs / send_timer.total_time;
+                double bw_gbps = bandwidth / 1024.0 / 1024.0 / 1024.0;
+                double latency = send_timer.total_time / repeat;
+
+                printf(
+                    "[Broadcast] Buffer Size: %5lu KB, Repeat: %6lu, "
+                    "Time: %8.3lf s, Total Time: %8.3lf s, "
+                    "BW: %8.3lf GB/s, Lat: %5g s\n",
+                    bufferSize / 1024, repeat, send_timer.total_time,
+                    total_timer.total_time, bw_gbps, latency);
+                fflush(stdout);
+                break;
+            }
+        }
+    }
+
+    free(broadcastBuffer);
 }
 
 void TestMRAMThroughput(PIMInterface *interface,
@@ -193,9 +250,9 @@ int main(int argc, char **argv) {
     if (interfaceType == "direct") {
         pimInterface = new DirectPIMInterface(nr_ranks, "dpu_benchmark");
     } else {
+        // Both UPMEM and broadcast use UPMEMInterface
         pimInterface = new UPMEMInterface(nr_ranks, "dpu_benchmark");
     }
-    // DirectPIMInterface pimInterface(DPU_ALLOCATE_ALL, "dpu");
 
     int nrOfDPUs = pimInterface->GetNrOfDPUs();
     uint8_t **dpuIDs = new uint8_t *[nrOfDPUs];
@@ -208,8 +265,6 @@ int main(int argc, char **argv) {
     // CPU -> PIM.WRAM : Not supported by direct interface. Use UPMEM interface.
     pimInterface->SendToPIMByUPMEM(dpuIDs, 0, "DPU_ID", 0, sizeof(uint64_t),
                                    false);
-    // following command will cause an error.
-    // pimInterface.SendToPIM(dpuIDs, "DPU_ID", 0, sizeof(uint64_t), false);
 
     // PIM.WRAM -> CPU : Supported by both direct and UPMEM interface.
     pimInterface->ReceiveFromPIM(dpuIDs, 0, "DPU_ID", 0, sizeof(uint64_t), false);
@@ -224,21 +279,25 @@ int main(int argc, char **argv) {
 
     cout << "PIM is running correctly" << endl;
 
-    // Open CSV file and write header
-    csv_file.open("benchmark_results.csv");
-    WriteCSVHeader();
-
-    // Generate test sizes: 1KB, 2KB, 4KB, ..., 1024KB
+    // Generate test sizes: 1KB, 2KB, 4KB, ..., 8MB
     vector<size_t> testSizes;
     for (size_t size = 1 << 10; size <= 8 << 20; size <<= 1) {
         testSizes.push_back(size);
     }
 
-    // Run benchmark twice
-    TestMRAMThroughput(pimInterface, testSizes);
-
-    csv_file.close();
-    cout << "Results saved to benchmark_results.csv" << endl;
+    if (interfaceType == "broadcast") {
+        // Broadcast benchmark: send-only, same data to all DPUs via UPMEM SDK
+        cout << "=== Broadcast Benchmark (UPMEM dpu_broadcast_to) ===" << endl;
+        TestBroadcastThroughput(pimInterface, testSizes);
+    } else {
+        // Scatter/gather benchmark: per-DPU data via direct or UPMEM interface
+        cout << "=== Scatter/Gather Benchmark (" << interfaceType << ") ===" << endl;
+        csv_file.open("benchmark_results.csv");
+        WriteCSVHeader();
+        TestMRAMThroughput(pimInterface, testSizes);
+        csv_file.close();
+        cout << "Results saved to benchmark_results.csv" << endl;
+    }
 
     for (int i = 0; i < nrOfDPUs; i++) {
         delete[] dpuIDs[i];

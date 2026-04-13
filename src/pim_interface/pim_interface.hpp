@@ -57,6 +57,14 @@ public:
                                 uint32_t symbol_offset, uint32_t length,
                                 bool async) = 0;
 
+    void BroadcastToPIM(uint8_t *buffer, std::string symbol_name,
+                        uint32_t symbol_offset, uint32_t length,
+                        bool async_transfer) {
+        auto sync_setup = async_transfer ? DPU_XFER_ASYNC : DPU_XFER_DEFAULT;
+        DPU_ASSERT(dpu_broadcast_to(dpu_set, symbol_name.c_str(),
+                                    symbol_offset, buffer, length, sync_setup));
+    }
+
     void SendToPIMByUPMEM(uint8_t** buffers, uint32_t buffer_offset, std::string symbol_name,
                           uint32_t symbol_offset, uint32_t length,
                           bool async_transfer) {
