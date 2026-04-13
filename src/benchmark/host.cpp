@@ -286,7 +286,9 @@ int main(int argc, char **argv) {
     }
 
     if (interfaceType == "broadcast") {
-        // Broadcast benchmark: send-only, same data to all DPUs via UPMEM SDK
+        // Broadcast benchmark: extend to 32MB (4x of scatter max)
+        testSizes.push_back(16 << 20);
+        testSizes.push_back(32 << 20);
         cout << "=== Broadcast Benchmark (UPMEM dpu_broadcast_to) ===" << endl;
         TestBroadcastThroughput(pimInterface, testSizes);
     } else {
