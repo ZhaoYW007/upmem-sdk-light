@@ -2,10 +2,13 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstdio>
+#include <ctime>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <sys/mman.h>
 #include <vector>
@@ -22,6 +25,31 @@ using namespace std;
 
 // Global CSV file stream
 ofstream csv_file;
+
+// Build a timestamped filename tagging the experiment.
+// Format: benchmark_<interface>[_send-MODE][_recv-MODE]_YYYYMMDD_HHMMSS.csv
+string MakeResultFilename(const string &interfaceType,
+                          const string &sendMode,
+                          const string &recvMode) {
+    auto now = std::chrono::system_clock::to_time_t(
+        std::chrono::system_clock::now());
+    std::tm tm_local;
+#ifdef _WIN32
+    localtime_s(&tm_local, &now);
+#else
+    localtime_r(&now, &tm_local);
+#endif
+    char ts[32];
+    std::strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", &tm_local);
+
+    std::ostringstream ss;
+    ss << "benchmark_" << interfaceType;
+    if (interfaceType == "direct") {
+        ss << "_send-" << sendMode << "_recv-" << recvMode;
+    }
+    ss << "_" << ts << ".csv";
+    return ss.str();
+}
 
 // Measure host row activations during a transfer using Bank Interface PMC.
 // Configures one DPU (DPU 0) to count HOST_ACTIVATE_COMMAND and CYCLES.
@@ -133,6 +161,10 @@ void WriteCSVHeader() {
              << "total_time_s,send_bw_gbps,recv_bw_gbps,send_lat_s,recv_lat_s" << endl;
 }
 
+void WriteBroadcastCSVHeader() {
+    csv_file << "buffer_kb,repeat,send_time_s,total_time_s,bw_gbps,lat_s" << endl;
+}
+
 void TestBroadcastThroughput(PIMInterface *interface,
                              const vector<size_t> &testSizes) {
     const double timeLimitPerTest = 2.0;
@@ -180,6 +212,16 @@ void TestBroadcastThroughput(PIMInterface *interface,
                     bufferSize / 1024, repeat, send_timer.total_time,
                     total_timer.total_time, bw_gbps, latency);
                 fflush(stdout);
+
+                if (csv_file.is_open()) {
+                    csv_file << bufferSize / 1024 << ","
+                             << repeat << ","
+                             << send_timer.total_time << ","
+                             << total_timer.total_time << ","
+                             << bw_gbps << ","
+                             << latency << endl;
+                }
+
                 break;
             }
         }
@@ -381,20 +423,26 @@ int main(int argc, char **argv) {
         testSizes.push_back(size);
     }
 
+    string csvFilename = MakeResultFilename(interfaceType, sendMode, recvMode);
+
     if (interfaceType == "broadcast") {
         // Broadcast benchmark: extend to 32MB (4x of scatter max)
         testSizes.push_back(16 << 20);
         testSizes.push_back(32 << 20);
         cout << "=== Broadcast Benchmark (UPMEM dpu_broadcast_to) ===" << endl;
+        csv_file.open(csvFilename);
+        WriteBroadcastCSVHeader();
         TestBroadcastThroughput(pimInterface, testSizes);
+        csv_file.close();
+        cout << "Results saved to " << csvFilename << endl;
     } else {
         // Scatter/gather benchmark: per-DPU data via direct or UPMEM interface
         cout << "=== Scatter/Gather Benchmark (" << interfaceType << ") ===" << endl;
-        csv_file.open("benchmark_results.csv");
+        csv_file.open(csvFilename);
         WriteCSVHeader();
         TestMRAMThroughput(pimInterface, testSizes);
         csv_file.close();
-        cout << "Results saved to benchmark_results.csv" << endl;
+        cout << "Results saved to " << csvFilename << endl;
 
         // Row activation measurement
         TestRowActivations(pimInterface, pimInterface->GetDpuSet(), testSizes);
