@@ -13,7 +13,6 @@
 
 #include "pim_interface.hpp"
 #include "parlay/parallel.h"
-#include "parlay/primitives.h"
 #include "parlay/internal/sequence_ops.h"
 
 extern "C" {
