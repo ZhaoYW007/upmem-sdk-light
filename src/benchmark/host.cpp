@@ -92,18 +92,21 @@ void TestRowActivations(PIMInterface *interface, dpu_set_t dpu_set,
 enum CommunicationDirection { Host2PIM = 0, PIM2Host = 1 };
 
 void parse_arguments(int argc, char **argv, int &nr_ranks,
-                     string &interfaceType) {
+                     string &interfaceType, string &sendMode, string &recvMode) {
     if (argc < 3) {
         fprintf(
             stderr,
-            "Usage: %s <nr_ranks> <Interface Type>\n"
-            "  Interface Types: direct, UPMEM, broadcast\n",
+            "Usage: %s <nr_ranks> <Interface Type> [Send Mode] [Recv Mode]\n"
+            "  Interface Types: direct, UPMEM, broadcast\n"
+            "  Send/Recv Modes (direct only): original (default), roundrobin, sequential\n",
             argv[0]);
         exit(1);
     }
 
     sscanf(argv[1], "%d", &nr_ranks);
     interfaceType = argv[2];
+    sendMode = (argc >= 4) ? argv[3] : "original";
+    recvMode = (argc >= 5) ? argv[4] : "original";
 
     if (interfaceType != "direct" && interfaceType != "UPMEM" &&
         interfaceType != "broadcast") {
@@ -112,6 +115,17 @@ void parse_arguments(int argc, char **argv, int &nr_ranks,
                 "or 'broadcast'.\n");
         exit(1);
     }
+
+    auto checkMode = [](const string &m, const char *which) {
+        if (m != "original" && m != "roundrobin" && m != "sequential") {
+            fprintf(stderr,
+                    "Invalid %s mode. Please enter 'original', 'roundrobin', "
+                    "or 'sequential'.\n", which);
+            exit(1);
+        }
+    };
+    checkMode(sendMode, "send");
+    checkMode(recvMode, "recv");
 }
 
 void WriteCSVHeader() {
@@ -312,14 +326,25 @@ void TestMRAMThroughput(PIMInterface *interface,
 int main(int argc, char **argv) {
     int nr_ranks;
     string interfaceType;
+    string sendMode, recvMode;
 
-    parse_arguments(argc, argv, nr_ranks, interfaceType);
+    parse_arguments(argc, argv, nr_ranks, interfaceType, sendMode, recvMode);
+
+    auto parseMode = [](const string &s) {
+        if (s == "roundrobin") return DirectPIMInterface::AccessMode::RoundRobin;
+        if (s == "sequential") return DirectPIMInterface::AccessMode::Sequential;
+        return DirectPIMInterface::AccessMode::Original;
+    };
 
     // To Allocate: identify the number of RANKS you want, or use
     // DPU_ALLOCATE_ALL to allocate all possible.
     PIMInterface *pimInterface;
     if (interfaceType == "direct") {
-        pimInterface = new DirectPIMInterface(nr_ranks, "dpu_benchmark");
+        DirectPIMInterface *direct = new DirectPIMInterface(nr_ranks, "dpu_benchmark");
+        direct->SetSendMode(parseMode(sendMode));
+        direct->SetRecvMode(parseMode(recvMode));
+        cout << "SendMode: " << sendMode << ", RecvMode: " << recvMode << endl;
+        pimInterface = direct;
     } else {
         // Both UPMEM and broadcast use UPMEMInterface
         pimInterface = new UPMEMInterface(nr_ranks, "dpu_benchmark");

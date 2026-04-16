@@ -160,6 +160,42 @@ class DirectPIMInterface : public PIMInterface {
         return ts.tv_sec + ts.tv_nsec / 1e9;
     }
 
+    // Read from one 64-byte cache line on the MRAM-mapped region and
+    // scatter the 8 resulting values to their DPU buffers.
+    // dpu_id_group is 0 (first group of 8 DPUs) or 4 (second group).
+    // offset_base is GetCorrectOffsetMRAM(symbol_offset + i*8, dpu_id)
+    //   (add 0x40 for the second group).
+    // Updates cyc_load/cyc_scatter if sample is true.
+    inline void __attribute__((always_inline)) LoadAndScatter(
+            uint8_t *ptr_dest, uint64_t offset,
+            uint8_t **buffers, uint32_t dpu_id, uint32_t dpu_id_group,
+            uint32_t i, uint64_t *cache_line, uint64_t *cache_line_interleave,
+            bool sample, uint64_t &cyc_load, uint64_t &cyc_scatter) {
+        uint64_t c0 = 0, c1 = 0, c2 = 0;
+        if (sample) c0 = __rdtsc();
+        // Inline LoadData
+        cache_line[0] = *((volatile uint64_t *)(ptr_dest + offset + 0));
+        cache_line[1] = *((volatile uint64_t *)(ptr_dest + offset + 8));
+        cache_line[2] = *((volatile uint64_t *)(ptr_dest + offset + 16));
+        cache_line[3] = *((volatile uint64_t *)(ptr_dest + offset + 24));
+        cache_line[4] = *((volatile uint64_t *)(ptr_dest + offset + 32));
+        cache_line[5] = *((volatile uint64_t *)(ptr_dest + offset + 40));
+        cache_line[6] = *((volatile uint64_t *)(ptr_dest + offset + 48));
+        cache_line[7] = *((volatile uint64_t *)(ptr_dest + offset + 56));
+        if (sample) c1 = __rdtsc();
+        byte_interleave_avx512(cache_line, cache_line_interleave, false);
+        for (int j = 0; j < 8; j++) {
+            if (buffers[j * 8 + dpu_id + dpu_id_group] == nullptr) continue;
+            *(((uint64_t *)buffers[j * 8 + dpu_id + dpu_id_group]) + i) =
+                cache_line_interleave[j];
+        }
+        if (sample) {
+            c2 = __rdtsc();
+            cyc_load += c1 - c0;
+            cyc_scatter += c2 - c1;
+        }
+    }
+
     void ReceiveFromRankMRAM(uint8_t **buffers, uint32_t symbol_offset,
                              uint8_t *ptr_dest, uint32_t length,
                              double &out_pre_flush, double &out_read,
@@ -187,80 +223,85 @@ class DirectPIMInterface : public PIMInterface {
         double t1 = get_time();
 
         uint64_t cache_line[8], cache_line_interleave[8];
-
-        auto LoadData = [](uint64_t *cache_line, uint8_t *ptr_dest) {
-            cache_line[0] = *((volatile uint64_t *)((uint8_t *)ptr_dest +
-                                                    0 * sizeof(uint64_t)));
-            cache_line[1] = *((volatile uint64_t *)((uint8_t *)ptr_dest +
-                                                    1 * sizeof(uint64_t)));
-            cache_line[2] = *((volatile uint64_t *)((uint8_t *)ptr_dest +
-                                                    2 * sizeof(uint64_t)));
-            cache_line[3] = *((volatile uint64_t *)((uint8_t *)ptr_dest +
-                                                    3 * sizeof(uint64_t)));
-            cache_line[4] = *((volatile uint64_t *)((uint8_t *)ptr_dest +
-                                                    4 * sizeof(uint64_t)));
-            cache_line[5] = *((volatile uint64_t *)((uint8_t *)ptr_dest +
-                                                    5 * sizeof(uint64_t)));
-            cache_line[6] = *((volatile uint64_t *)((uint8_t *)ptr_dest +
-                                                    6 * sizeof(uint64_t)));
-            cache_line[7] = *((volatile uint64_t *)((uint8_t *)ptr_dest +
-                                                    7 * sizeof(uint64_t)));
-        };
-
         uint64_t cyc_load = 0, cyc_scatter = 0;
+        uint32_t n_words = length / sizeof(uint64_t);
 
-        for (uint32_t dpu_id = 0; dpu_id < 4; ++dpu_id) {
-            double t_dpuid = get_time();
-            for (uint32_t i = 0; i < length / sizeof(uint64_t); ++i) {
-                if ((i % 8 == 0) && (i + 8 < length / sizeof(uint64_t))) {
-                    for (int j = 0; j < 16; j++) {
-                        __builtin_prefetch(
-                            ((uint64_t *)buffers[j * 4 + dpu_id]) + i + 8);
+        // Initialize per-dpu_id timing to 0 (modes may not populate all)
+        for (int d = 0; d < 4; d++) out_read_per_dpuid[d] = 0;
+
+        if (recv_mode == AccessMode::Original) {
+            // Mode 1: dpu_id outer, i inner, alternate banks {dpu_id, dpu_id+4}
+            for (uint32_t dpu_id = 0; dpu_id < 4; ++dpu_id) {
+                double t_dpuid = get_time();
+                for (uint32_t i = 0; i < n_words; ++i) {
+                    if ((i % 8 == 0) && (i + 8 < n_words)) {
+                        for (int j = 0; j < 16; j++)
+                            __builtin_prefetch(
+                                ((uint64_t *)buffers[j * 4 + dpu_id]) + i + 8);
                     }
+                    uint64_t offset =
+                        GetCorrectOffsetMRAM(symbol_offset + (i * 8), dpu_id);
+                    if (i + 3 < n_words) {
+                        uint64_t ofs_pf = GetCorrectOffsetMRAM(
+                            symbol_offset + ((i + 3) * 8), dpu_id);
+                        __builtin_prefetch(ptr_dest + ofs_pf);
+                        __builtin_prefetch(ptr_dest + ofs_pf + 0x40);
+                    }
+                    bool sample = ((i & 31) == 0);
+                    LoadAndScatter(ptr_dest, offset, buffers, dpu_id, 0, i,
+                                   cache_line, cache_line_interleave,
+                                   sample, cyc_load, cyc_scatter);
+                    LoadAndScatter(ptr_dest, offset + 0x40, buffers, dpu_id, 4, i,
+                                   cache_line, cache_line_interleave,
+                                   sample, cyc_load, cyc_scatter);
                 }
-                uint64_t offset =
-                    GetCorrectOffsetMRAM(symbol_offset + (i * 8), dpu_id);
-                if (i + 3 < length / sizeof(uint64_t)) {
-                    uint64_t offset_prefetch = GetCorrectOffsetMRAM(
-                        symbol_offset + ((i + 3) * 8), dpu_id);
-                    __builtin_prefetch(ptr_dest + offset_prefetch);
-                    __builtin_prefetch(ptr_dest + offset_prefetch + 0x40);
+                out_read_per_dpuid[dpu_id] = get_time() - t_dpuid;
+            }
+        } else if (recv_mode == AccessMode::RoundRobin) {
+            // Mode 2: i outer, cycle through all 8 banks per i
+            // (dpu_id 0..3, each with group 0 and group 4)
+            for (uint32_t i = 0; i < n_words; ++i) {
+                if ((i % 8 == 0) && (i + 8 < n_words)) {
+                    for (int j = 0; j < 64; j++)
+                        if (buffers[j] != nullptr)
+                            __builtin_prefetch(((uint64_t *)buffers[j]) + i + 8);
                 }
-
                 bool sample = ((i & 31) == 0);
-                uint64_t c0, c1, c2, c3, c4;
-
-                if (sample) c0 = __rdtsc();
-                LoadData(cache_line, ptr_dest + offset);
-                if (sample) c1 = __rdtsc();
-                byte_interleave_avx512(cache_line, cache_line_interleave, false);
-                for (int j = 0; j < 8; j++) {
-                    if (buffers[j * 8 + dpu_id] == nullptr) {
-                        continue;
-                    }
-                    *(((uint64_t *)buffers[j * 8 + dpu_id]) + i) =
-                        cache_line_interleave[j];
-                }
-                if (sample) c2 = __rdtsc();
-
-                offset += 0x40;
-                LoadData(cache_line, ptr_dest + offset);
-                if (sample) c3 = __rdtsc();
-                byte_interleave_avx512(cache_line, cache_line_interleave, false);
-                for (int j = 0; j < 8; j++) {
-                    if (buffers[j * 8 + dpu_id + 4] == nullptr) {
-                        continue;
-                    }
-                    *(((uint64_t *)buffers[j * 8 + dpu_id + 4]) + i) =
-                        cache_line_interleave[j];
-                }
-                if (sample) {
-                    c4 = __rdtsc();
-                    cyc_load += (c1 - c0) + (c3 - c2);
-                    cyc_scatter += (c2 - c1) + (c4 - c3);
+                for (uint32_t dpu_id = 0; dpu_id < 4; ++dpu_id) {
+                    uint64_t offset =
+                        GetCorrectOffsetMRAM(symbol_offset + (i * 8), dpu_id);
+                    LoadAndScatter(ptr_dest, offset, buffers, dpu_id, 0, i,
+                                   cache_line, cache_line_interleave,
+                                   sample, cyc_load, cyc_scatter);
+                    LoadAndScatter(ptr_dest, offset + 0x40, buffers, dpu_id, 4, i,
+                                   cache_line, cache_line_interleave,
+                                   sample, cyc_load, cyc_scatter);
                 }
             }
-            out_read_per_dpuid[dpu_id] = get_time() - t_dpuid;
+        } else {
+            // Mode 3: Sequential per bank — finish bank k fully, then bank k+1
+            // 8 banks: (dpu_id, group) = (0,0),(0,4),(1,0),(1,4),...(3,0),(3,4)
+            for (uint32_t dpu_id = 0; dpu_id < 4; ++dpu_id) {
+                double t_dpuid = get_time();
+                for (uint32_t group = 0; group < 2; ++group) {
+                    uint32_t group_off = group * 0x40;
+                    uint32_t dpu_group = group * 4;
+                    for (uint32_t i = 0; i < n_words; ++i) {
+                        if ((i % 8 == 0) && (i + 8 < n_words)) {
+                            for (int j = 0; j < 8; j++)
+                                __builtin_prefetch(
+                                    ((uint64_t *)buffers[j * 8 + dpu_id + dpu_group]) + i + 8);
+                        }
+                        uint64_t offset =
+                            GetCorrectOffsetMRAM(symbol_offset + (i * 8), dpu_id) + group_off;
+                        bool sample = ((i & 31) == 0);
+                        LoadAndScatter(ptr_dest, offset, buffers, dpu_id, dpu_group, i,
+                                       cache_line, cache_line_interleave,
+                                       sample, cyc_load, cyc_scatter);
+                    }
+                }
+                out_read_per_dpuid[dpu_id] = get_time() - t_dpuid;
+            }
         }
 
         double t2 = get_time();
@@ -287,9 +328,30 @@ class DirectPIMInterface : public PIMInterface {
         out_scatter_frac = cyc_total > 0 ? (double)cyc_scatter / cyc_total : 0;
     }
 
-    // Original: dpu_id outer, i inner — sequential access per bank.
-    // Row-sorted access was tested and showed no improvement (closed-page
-    // confirmed: MC does not keep rows open for WC streaming stores).
+    // Gather 8 uint64_t from 8 host buffers and stream-store one cache line
+    // to MRAM at (ptr_dest + offset). dpu_id_group is 0 or 4.
+    inline void __attribute__((always_inline)) GatherAndStore(
+            uint8_t *ptr_dest, uint64_t offset,
+            uint8_t **buffers, uint32_t dpu_id, uint32_t dpu_id_group,
+            uint32_t i, uint64_t *cache_line,
+            bool sample, uint64_t &cyc_gather, uint64_t &cyc_store) {
+        uint64_t c0 = 0, c1 = 0, c2 = 0;
+        if (sample) c0 = __rdtsc();
+        for (int j = 0; j < 8; j++) {
+            if (buffers[j * 8 + dpu_id + dpu_id_group] == nullptr) continue;
+            cache_line[j] =
+                *(((uint64_t *)buffers[j * 8 + dpu_id + dpu_id_group]) + i);
+        }
+        if (sample) c1 = __rdtsc();
+        byte_interleave_avx512(cache_line,
+                               (uint64_t *)(ptr_dest + offset), true);
+        if (sample) {
+            c2 = __rdtsc();
+            cyc_gather += c1 - c0;
+            cyc_store += c2 - c1;
+        }
+    }
+
     void SendToRankMRAM(uint8_t **buffers, uint32_t symbol_offset,
                         uint8_t *ptr_dest, uint32_t length,
                         double &out_write, double &out_fence,
@@ -301,51 +363,72 @@ class DirectPIMInterface : public PIMInterface {
 
         uint64_t cache_line[8];
         uint64_t cyc_gather = 0, cyc_store = 0;
+        uint32_t n_words = length / sizeof(uint64_t);
+
+        for (int d = 0; d < 4; d++) out_write_per_dpuid[d] = 0;
 
         double t0 = get_time();
 
-        for (uint32_t dpu_id = 0; dpu_id < 4; ++dpu_id) {
-            double t_dpuid = get_time();
-            for (uint32_t i = 0; i < length / sizeof(uint64_t); ++i) {
-                if ((i % 8 == 0) && (i + 8 < length / sizeof(uint64_t))) {
-                    for (int j = 0; j < 16; j++) {
-                        __builtin_prefetch(
-                            ((uint64_t *)buffers[j * 4 + dpu_id]) + i + 8);
+        if (send_mode == AccessMode::Original) {
+            // Mode 1: dpu_id outer, i inner, alternate banks {dpu_id, dpu_id+4}
+            for (uint32_t dpu_id = 0; dpu_id < 4; ++dpu_id) {
+                double t_dpuid = get_time();
+                for (uint32_t i = 0; i < n_words; ++i) {
+                    if ((i % 8 == 0) && (i + 8 < n_words)) {
+                        for (int j = 0; j < 16; j++)
+                            __builtin_prefetch(
+                                ((uint64_t *)buffers[j * 4 + dpu_id]) + i + 8);
                     }
+                    uint64_t offset =
+                        GetCorrectOffsetMRAM(symbol_offset + (i * 8), dpu_id);
+                    bool sample = ((i & 31) == 0);
+                    GatherAndStore(ptr_dest, offset, buffers, dpu_id, 0, i,
+                                   cache_line, sample, cyc_gather, cyc_store);
+                    GatherAndStore(ptr_dest, offset + 0x40, buffers, dpu_id, 4, i,
+                                   cache_line, sample, cyc_gather, cyc_store);
                 }
-                uint64_t offset =
-                    GetCorrectOffsetMRAM(symbol_offset + (i * 8), dpu_id);
-
+                out_write_per_dpuid[dpu_id] = get_time() - t_dpuid;
+            }
+        } else if (send_mode == AccessMode::RoundRobin) {
+            // Mode 2: i outer, cycle through all 8 banks per i
+            for (uint32_t i = 0; i < n_words; ++i) {
+                if ((i % 8 == 0) && (i + 8 < n_words)) {
+                    for (int j = 0; j < 64; j++)
+                        if (buffers[j] != nullptr)
+                            __builtin_prefetch(((uint64_t *)buffers[j]) + i + 8);
+                }
                 bool sample = ((i & 31) == 0);
-                uint64_t c0, c1, c2, c3, c4;
-
-                if (sample) c0 = __rdtsc();
-                for (int j = 0; j < 8; j++) {
-                    if (buffers[j * 8 + dpu_id] == nullptr) continue;
-                    cache_line[j] =
-                        *(((uint64_t *)buffers[j * 8 + dpu_id]) + i);
-                }
-                if (sample) c1 = __rdtsc();
-                byte_interleave_avx512(cache_line,
-                                       (uint64_t *)(ptr_dest + offset), true);
-                if (sample) c2 = __rdtsc();
-
-                offset += 0x40;
-                for (int j = 0; j < 8; j++) {
-                    if (buffers[j * 8 + dpu_id + 4] == nullptr) continue;
-                    cache_line[j] =
-                        *(((uint64_t *)buffers[j * 8 + dpu_id + 4]) + i);
-                }
-                if (sample) c3 = __rdtsc();
-                byte_interleave_avx512(cache_line,
-                                       (uint64_t *)(ptr_dest + offset), true);
-                if (sample) {
-                    c4 = __rdtsc();
-                    cyc_gather += (c1 - c0) + (c3 - c2);
-                    cyc_store += (c2 - c1) + (c4 - c3);
+                for (uint32_t dpu_id = 0; dpu_id < 4; ++dpu_id) {
+                    uint64_t offset =
+                        GetCorrectOffsetMRAM(symbol_offset + (i * 8), dpu_id);
+                    GatherAndStore(ptr_dest, offset, buffers, dpu_id, 0, i,
+                                   cache_line, sample, cyc_gather, cyc_store);
+                    GatherAndStore(ptr_dest, offset + 0x40, buffers, dpu_id, 4, i,
+                                   cache_line, sample, cyc_gather, cyc_store);
                 }
             }
-            out_write_per_dpuid[dpu_id] = get_time() - t_dpuid;
+        } else {
+            // Mode 3: Sequential per bank — finish bank k fully, then bank k+1
+            for (uint32_t dpu_id = 0; dpu_id < 4; ++dpu_id) {
+                double t_dpuid = get_time();
+                for (uint32_t group = 0; group < 2; ++group) {
+                    uint32_t group_off = group * 0x40;
+                    uint32_t dpu_group = group * 4;
+                    for (uint32_t i = 0; i < n_words; ++i) {
+                        if ((i % 8 == 0) && (i + 8 < n_words)) {
+                            for (int j = 0; j < 8; j++)
+                                __builtin_prefetch(
+                                    ((uint64_t *)buffers[j * 8 + dpu_id + dpu_group]) + i + 8);
+                        }
+                        uint64_t offset =
+                            GetCorrectOffsetMRAM(symbol_offset + (i * 8), dpu_id) + group_off;
+                        bool sample = ((i & 31) == 0);
+                        GatherAndStore(ptr_dest, offset, buffers, dpu_id, dpu_group, i,
+                                       cache_line, sample, cyc_gather, cyc_store);
+                    }
+                }
+                out_write_per_dpuid[dpu_id] = get_time() - t_dpuid;
+            }
         }
 
         double t1 = get_time();
@@ -443,6 +526,15 @@ class DirectPIMInterface : public PIMInterface {
     }
 
    public:
+    enum class AccessMode { Original = 0, RoundRobin = 1, Sequential = 2 };
+    AccessMode recv_mode = AccessMode::Original;
+    AccessMode send_mode = AccessMode::Original;
+
+    void SetRecvMode(AccessMode mode) { recv_mode = mode; }
+    AccessMode GetRecvMode() const { return recv_mode; }
+    void SetSendMode(AccessMode mode) { send_mode = mode; }
+    AccessMode GetSendMode() const { return send_mode; }
+
     struct SendTimingAccum {
         double align = 0, parallel = 0;
         double mux_max = 0, write_max = 0, fence_max = 0;
